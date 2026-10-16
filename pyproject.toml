@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phasescope"
+version = "0.1.0"
+description = "Live camera imaging, filtering, phase-stepping interferometry and 2D/3D visualisation"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.23",
+    "scipy>=1.9",
+    "opencv-python-headless>=4.7",
+    "PyQt5>=5.15",
+    "pyqtgraph>=0.13.3",
+    "PyOpenGL>=3.1",
+    "scikit-image>=0.20",
+]
+
+[project.optional-dependencies]
+fallback3d = ["matplotlib>=3.6"]
+piezo = ["pyserial>=3.5"]
+test = ["pytest", "matplotlib>=3.6"]
+
+[project.scripts]
+phasescope = "phasescope.__main__:main"
+
+[tool.setuptools]
+packages = ["phasescope"]

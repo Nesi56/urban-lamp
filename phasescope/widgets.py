@@ -387,10 +387,28 @@ class ImagePanel(QtWidgets.QWidget):
 
     # -- configuration ----------------------------------------------------
     def set_popup_menu(self, menu: QtWidgets.QMenu) -> None:
-        """Right click on the image, its margins or the empty panel opens ``menu``
-        (in place of pyqtgraph's View All / Axis / Export menu)."""
+        """Right click on the image, its margins, the colour bar, the boxes and the profile line
+        opens ``menu`` (in place of pyqtgraph's View All / Axis / Export and gradient menus)."""
         self.image.popup_menu = menu
-        self.vb.raiseContextMenu = lambda ev: menu.popup(ev.screenPos().toPoint())
+        self._popup = menu
+        self.vb.raiseContextMenu = self._raise_popup
+        if self.hist is not None:
+            self.hist.vb.raiseContextMenu = self._raise_popup
+            self.hist.gradient.showMenu = self._raise_popup  # its presets would bypass the Colours box
+        for item in (self.roi_item, self.profile_line):
+            if item is not None:
+                self.add_popup_item(item)
+
+    def add_popup_item(self, roi: pg.ROI) -> None:
+        """Let a box or line drawn on the image open the panel's menu on a right click."""
+        roi.contextMenuEnabled = lambda: getattr(self, "_popup", None) is not None
+        roi.raiseContextMenu = self._raise_popup
+
+    def _raise_popup(self, ev) -> None:
+        menu = getattr(self, "_popup", None)
+        if menu is not None:
+            pos = ev.screenPos()
+            menu.popup(QtCore.QPoint(int(pos.x()), int(pos.y())))
 
     def set_colormap(self, name: str) -> None:
         self._cmap_name = name

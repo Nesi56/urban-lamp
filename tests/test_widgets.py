@@ -555,3 +555,17 @@ def test_param_dialog_reject_drops_pending_update(app):
     dlg.reject()
     _pump(app, 0.25)
     assert [e["amount"] for e in emitted] == [pytest.approx(2.0)]
+
+
+def test_colour_bar_and_boxes_open_the_panel_menu(app):
+    from pyqtgraph.Qt import QtWidgets
+
+    from phasescope.widgets import ImagePanel
+
+    panel = ImagePanel(histogram=True, profile=True, roi=True)
+    menu = QtWidgets.QMenu()
+    panel.set_popup_menu(menu)
+    assert panel.hist.gradient.showMenu == panel._raise_popup  # no pyqtgraph gradient presets
+    assert panel.hist.vb.raiseContextMenu == panel._raise_popup
+    for item in (panel.roi_item, panel.profile_line):
+        assert item.contextMenuEnabled() and item.raiseContextMenu == panel._raise_popup

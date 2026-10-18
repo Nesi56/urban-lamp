@@ -455,3 +455,18 @@ def test_stop_before_run_starts(app):
     th.start()
     th.stop()
     assert not th.isRunning()
+
+
+def test_new_phase_worker_waits_for_an_abandoned_one_without_blocking(app, make_thread):
+    th = make_thread(SimulatedInterferometer(width=64, height=48))
+    busy = threading.Thread(target=time.sleep, args=(0.5,), daemon=True)
+    busy.start()
+    with A.AcquisitionThread._abandoned_lock:
+        A.AcquisitionThread._abandoned.append(busy)
+    t0 = time.monotonic()
+    assert th._ensure_worker() is None  # does not wait for it
+    assert time.monotonic() - t0 < 0.1
+    busy.join()
+    w = th._ensure_worker()
+    assert w is not None and w.is_alive()
+    th._stop_worker()

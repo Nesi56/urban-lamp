@@ -727,6 +727,11 @@ class Pipeline:
         with self._lock:
             self._steps.clear()
 
+    def signature(self) -> tuple:
+        """Which steps, parameters and on/off states there are (tells results' processing apart)."""
+        with self._lock:
+            return tuple((st.op.key, repr(st.params), st.enabled) for st in self._steps)
+
     def set_params(self, index: int, params: dict[str, Any]) -> None:
         """Change a step's parameters.  Its state is kept: stateful operations reset
         themselves when a relevant parameter changes (so e.g. switching the background

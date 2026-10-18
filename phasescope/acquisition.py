@@ -37,6 +37,9 @@ class FramePacket:
     # processed without temporal steps (for manual phase steps, see AcquisitionThread.step_frames);
     # the same array as ``processed`` when no temporal step ran
     processed_step: np.ndarray | None = None
+    # False when a temporal step ran and processed_step could not be split off it (it is then
+    # the temporally processed frame and must not be used as a phase step)
+    step_exact: bool = True
 
 
 def _error_text(exc: BaseException) -> str:
@@ -135,9 +138,10 @@ class StackWorker(threading.Thread):
     """Analyses one recorded phase-stepping sequence next to the acquisition thread."""
 
     def __init__(self, frames: list[np.ndarray], cfg: PhaseConfig, seq_id: int,
-                 done: Callable[["StackWorker", PhaseResult | None, str], None]) -> None:
+                 done: Callable[["StackWorker", PhaseResult | None, str], None], settings=None) -> None:
         super().__init__(name="PhaseScope stepping analysis", daemon=True)
         self.frames, self.cfg, self.seq_id = frames, cfg, seq_id
+        self.settings = settings  # (roi, pipeline signature, bypass) when the sequence was recorded
         self._done = done  # (worker, result or None, error text)
 
     def run(self) -> None:
@@ -361,7 +365,7 @@ class AcquisitionThread(QtCore.QThread):
             else:
                 self._emit_finished(seq_id, ok, reason)
 
-    def _hand_off(self, frames: list[np.ndarray], cfg: PhaseConfig, seq_id: int) -> None:
+    def _hand_off(self, frames: list[np.ndarray], cfg: PhaseConfig, seq_id: int, settings=None) -> None:
         """Analyse a recorded sequence in a StackWorker, after the previous analysis finished."""
         prev = self._analysis
         while prev is not None and prev.is_alive() and self._running and not self._cancel_sequence:
@@ -371,7 +375,7 @@ class AcquisitionThread(QtCore.QThread):
         with self._finish_lock:
             if self._stop_requested:
                 return
-            job = self._analysis = StackWorker(frames, cfg, seq_id, self._analysis_done)
+            job = self._analysis = StackWorker(frames, cfg, seq_id, self._analysis_done, settings)
         job.start()
 
     def _analysis_done(self, job: StackWorker, result: PhaseResult | None, error: str) -> None:
@@ -382,6 +386,8 @@ class AcquisitionThread(QtCore.QThread):
             try:
                 if result is not None:
                     result.info["sequence_id"] = job.seq_id  # lets the GUI drop maps of cancelled runs
+                    if job.settings is not None:  # region and processing the frames were recorded with
+                        result.info["sequence_settings"] = job.settings
                     self._publish_phase(result)
                     self._emit_finished(job.seq_id, True, "")
                 else:
@@ -403,15 +409,20 @@ class AcquisitionThread(QtCore.QThread):
             except Exception as exc:
                 self._report(_error_text(exc))
 
-    _abandoned: list[PhaseWorker] = []  # workers told to stop that may still finish a big frame
+    # workers told to stop that may still finish a big frame (shared by all acquisition threads)
+    _abandoned: list[PhaseWorker] = []
+    _abandoned_lock = threading.Lock()
 
-    def _ensure_worker(self) -> PhaseWorker:
+    def _ensure_worker(self) -> PhaseWorker | None:
+        """The live phase worker; None while a stopped one still finishes its frame.
+
+        Never waits: the camera keeps streaming, and no two heavy analyses run at once."""
         w = self._worker
         if w is None or not w.is_alive():
-            for old in list(AcquisitionThread._abandoned):  # never run several heavy analyses at once
-                old.join(5.0)
-                if not old.is_alive():
-                    AcquisitionThread._abandoned.remove(old)
+            with AcquisitionThread._abandoned_lock:
+                AcquisitionThread._abandoned[:] = [old for old in AcquisitionThread._abandoned if old.is_alive()]
+                if AcquisitionThread._abandoned:
+                    return None
             w = PhaseWorker(self._publish_phase, lambda: self.config.method == "ftp" and not self.hold)
             w.start()
             self._worker = w
@@ -422,7 +433,8 @@ class AcquisitionThread(QtCore.QThread):
         if w is not None:
             w.stop(self.WORKER_JOIN_S)
             if w.is_alive():
-                AcquisitionThread._abandoned.append(w)
+                with AcquisitionThread._abandoned_lock:
+                    AcquisitionThread._abandoned.append(w)
 
     def _grab(self) -> np.ndarray | None:
         raw = self.source.grab()
@@ -446,9 +458,9 @@ class AcquisitionThread(QtCore.QThread):
         return sub if sub.size else raw
 
     def _publish(self, raw, processed, step: str = "", phase_error: str = "",
-                 processed_step: np.ndarray | None = None) -> None:
+                 processed_step: np.ndarray | None = None, step_exact: bool = True) -> None:
         pkt = FramePacket(raw, processed, self._index, time.time(), self._fps, step, phase_error,
-                          processed if processed_step is None else processed_step)
+                          processed if processed_step is None else processed_step, step_exact)
         with self._lock:
             self._frame = pkt
 
@@ -461,18 +473,22 @@ class AcquisitionThread(QtCore.QThread):
         if raw is None:
             return
         cropped = self._crop(raw)
-        if self.step_frames and self._temporal_active():
+        temporal = self._temporal_active()
+        split = self.step_frames and temporal
+        if split:
             processed, step = self.pipeline.apply_split(cropped)
         else:
             processed = step = self.pipeline.apply(cropped)
         cfg = self.config
         live_phase = cfg.method == "ftp" and not self.hold
         self._publish(raw, processed, phase_error=self.phase_error if live_phase else "",
-                      processed_step=step)
+                      processed_step=step, step_exact=split or not temporal)
         worker = self._worker
         if live_phase:
             if self._running:
-                self._ensure_worker().offer(processed, cropped, cfg)
+                worker = self._ensure_worker()
+                if worker is not None:
+                    worker.offer(processed, cropped, cfg)
         elif worker is not None:
             worker.discard()
 
@@ -489,9 +505,11 @@ class AcquisitionThread(QtCore.QThread):
     def _run_sequence(self, seq_id: int) -> None:
         try:
             cfg = self.config
+            p = self.pipeline
+            settings = (self.roi, p.signature(), p.bypass)
             frames = self._record_sequence(cfg, seq_id)
             if frames is not None:
-                self._hand_off(frames, cfg, seq_id)
+                self._hand_off(frames, cfg, seq_id, settings)
         finally:
             with self._seq_lock:
                 self._active_id = None

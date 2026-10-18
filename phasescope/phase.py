@@ -147,16 +147,24 @@ def _freq_index(n: int) -> np.ndarray:
     return np.fft.fftfreq(n, 1.0 / n).round().astype(np.int64)
 
 
-def _carrier_from_spectrum(spec: np.ndarray, dc_exclude: int) -> tuple[int, int]:
-    h, w = spec.shape
+def _dc_disc(shape: tuple[int, int], dc_exclude: int) -> np.ndarray:
+    """True for the FFT bins within ``dc_exclude`` bins of the zero order."""
+    ky = _freq_index(shape[0])[:, None]
+    kx = _freq_index(shape[1])[None, :]
+    return (kx * kx + ky * ky) <= dc_exclude * dc_exclude
+
+
+def _carrier_from_magnitude(mag: np.ndarray, dc_exclude: int) -> tuple[int, int]:
+    h, w = mag.shape
     ky = _freq_index(h)[:, None]
     kx = _freq_index(w)[None, :]
-    mag = np.abs(spec)
-    blocked = (kx * kx + ky * ky) <= dc_exclude * dc_exclude
-    blocked = blocked | (kx < 0) | ((kx == 0) & (ky <= 0))  # keep one half-plane
-    mag[blocked] = 0
-    iy, ix = np.unravel_index(int(np.argmax(mag)), mag.shape)
+    blocked = _dc_disc(mag.shape, dc_exclude) | (kx < 0) | ((kx == 0) & (ky <= 0))  # one half-plane
+    iy, ix = np.unravel_index(int(np.argmax(np.where(blocked, 0, mag))), mag.shape)
     return int(kx[0, ix]), int(ky[iy, 0])
+
+
+def _carrier_from_spectrum(spec: np.ndarray, dc_exclude: int) -> tuple[int, int]:
+    return _carrier_from_magnitude(np.abs(spec), dc_exclude)
 
 
 def find_carrier(img: np.ndarray, dc_exclude: int = 4) -> tuple[int, int]:
@@ -176,16 +184,25 @@ def phase_from_fourier(img: np.ndarray, carrier: tuple[int, int] | None = None,
 
     ``filter_radius`` is the radius of the side-lobe window as a fraction of the
     carrier distance (0.5 = half way to the zero order).
+
+    ``info['carrier_snr']`` is the spectrum magnitude at the carrier divided by the
+    median magnitude outside the zero-order disc: about 4 for pure noise, hundreds
+    for clear fringes.
     """
     img = np.asarray(img, dtype=np.float32)
     h, w = img.shape
     spec = sfft.fft2(img - img.mean(), workers=-1)
+    mag = np.abs(spec)
     if carrier is None or tuple(carrier) == (0, 0):
-        carrier = _carrier_from_spectrum(spec, dc_exclude)
+        carrier = _carrier_from_magnitude(mag, dc_exclude)
     kx, ky = int(carrier[0]), int(carrier[1])
     kr = float(np.hypot(kx, ky))
     if kr < 1:
         raise ValueError("no carrier fringes found - tilt the reference mirror or use phase stepping")
+    outside = mag[~_dc_disc(mag.shape, dc_exclude)]
+    floor = float(np.median(outside)) if outside.size else 0.0
+    peak = float(mag[ky % h, kx % w])
+    snr = peak / floor if floor > 0 else (float("inf") if peak > 0 else 0.0)
     # distance to the side-lobe on the periodic frequency grid
     dy = (_freq_index(h)[:, None] - ky + h // 2) % h - h // 2
     dx = (_freq_index(w)[None, :] - kx + w // 2) % w - w // 2
@@ -194,7 +211,8 @@ def phase_from_fourier(img: np.ndarray, carrier: tuple[int, int] | None = None,
     window = np.exp(-np.log(2.0) * d2 * d2)  # super-Gaussian, 0.5 at radius r
     side = np.roll(spec * window, shift=(-ky, -kx), axis=(0, 1))  # remove the carrier
     field_ = sfft.ifft2(side, workers=-1)
-    info = {"carrier_px": (kx, ky), "fringe_period_px": float(1.0 / np.hypot(kx / w, ky / h))}
+    info = {"carrier_px": (kx, ky), "fringe_period_px": float(1.0 / np.hypot(kx / w, ky / h)),
+            "carrier_snr": snr}
     return np.angle(field_).astype(np.float32), (2.0 * np.abs(field_)).astype(np.float32), info
 
 
@@ -429,6 +447,9 @@ class PhaseConfig:
     settle_ms: float = 30.0
     discard_frames: int = 0
     frames_per_step: int = 1
+    # fit the background only on this flat reference area (x, y, w, h in
+    # processed-image pixels); None = fit on the whole valid area
+    level_region: tuple[int, int, int, int] | None = None
 
     @property
     def is_stepping(self) -> bool:
@@ -439,6 +460,16 @@ class PhaseConfig:
 
     def with_(self, **kw) -> "PhaseConfig":
         return replace(self, **kw)
+
+
+def _fmt_value(v: float) -> str:
+    """Compact number: 794, 12.3, 3.14, 0.00123."""
+    v = float(v)
+    return f"{v:.0f}" if np.isfinite(v) and abs(v) >= 100 else f"{v:.3g}"
+
+
+def _fmt_px(p: float) -> str:
+    return f"{p:.0f}" if p >= 100 else f"{p:.1f}"
 
 
 @dataclass
@@ -454,6 +485,34 @@ class PhaseResult:
     config: PhaseConfig | None = None  # settings the result was computed with
     timestamp: float = field(default_factory=time.time)
 
+    def fields(self) -> list[tuple[str, str, str]]:
+        """``(label, value, tooltip)`` rows describing the result in plain language."""
+        info, u = self.info, (f" {self.unit}" if self.unit else "")
+        rows: list[tuple[str, str, str]] = []
+        if "pv" in info:
+            rows.append(("Peak-to-valley", f"{_fmt_value(info['pv'])}{u}",
+                         "Highest minus lowest point of the valid area, after background removal"))
+        if "rms" in info:
+            rows.append(("RMS", f"{_fmt_value(info['rms'])}{u}",
+                         "Standard deviation of the map – a roughness measure"))
+        if "valid_fraction" in info:
+            rows.append(("Valid pixels", f"{100 * info['valid_fraction']:.0f} %",
+                         "Share of pixels with enough fringe contrast; the others are blank"))
+        if "fringe_period_px" in info:
+            rows.append(("Fringe spacing", f"{info['fringe_period_px']:.1f} px",
+                         "Distance between neighbouring fringes in the processed image – "
+                         "5 to 20 px works best"))
+        if "estimated_step_deg" in info:
+            rows.append(("Measured step", f"{info['estimated_step_deg']:.1f}°",
+                         "Phase step between the frames as measured by the Carré algorithm – "
+                         "adjust the piezo 'volts per 2π' until it reads 90°"))
+        rows.append(("Time", time.strftime("%H:%M:%S", time.localtime(self.timestamp)),
+                     "Time this map was computed"))
+        if "seconds" in info:
+            rows.append(("Compute", f"{1000 * info['seconds']:.0f} ms",
+                         "Processing time for this map (phase retrieval, unwrapping and levelling)"))
+        return rows
+
     def summary(self) -> str:
         parts = [self.info.get("method", "")]
         if "pv" in self.info:
@@ -462,25 +521,126 @@ class PhaseResult:
             parts.append(f"RMS {self.info['rms']:.4g}{u}")
         if "estimated_step_deg" in self.info:
             parts.append(f"measured step {self.info['estimated_step_deg']:.1f}°")
-        if "carrier_px" in self.info:
-            parts.append(f"carrier {self.info['carrier_px']}")
+        if "fringe_period_px" in self.info:
+            parts.append(f"fringe spacing {self.info['fringe_period_px']:.1f} px")
+        if self.info.get("levelled_on") == "reference area":
+            parts.append("levelled on reference area")
         parts.append(f"valid {100 * self.info.get('valid_fraction', 1):.0f}%")
         parts.append(f"{1000 * self.info.get('seconds', 0):.0f} ms")
         return "  |  ".join(p for p in parts if p)
 
 
+def _metric(info: dict, key: str, allow_inf: bool = False) -> float | None:
+    try:
+        v = float(info[key])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if np.isnan(v) or (np.isinf(v) and not allow_inf):
+        return None
+    return v
+
+
+def fringe_quality(info: dict) -> tuple[str, str]:
+    """Rate the fringes behind a result: ``(level, message)``.
+
+    ``level`` is "good", "fair", "poor" or "unknown" (no metric in ``info``); the
+    message says in plain language what is wrong and how to fix it.  The worst of
+    carrier SNR, fringe spacing and fringe contrast decides.
+    """
+    snr = _metric(info, "carrier_snr", allow_inf=True)
+    period = _metric(info, "fringe_period_px")
+    contrast = _metric(info, "contrast")
+    found: list[tuple[str, str]] = []
+    if snr is not None:
+        if snr < 20:
+            found.append(("poor", "No clear fringes – this map is mostly noise. "
+                                  "Align the reference until straight fringes appear."))
+        elif snr < 50:
+            found.append(("fair", "Fringes usable – but weak, so the map is noisy. "
+                                  "Align the reference until the fringes look straight and crisp."))
+    if period is not None:
+        p = _fmt_px(period)
+        if period > 30:
+            found.append(("poor", f"Too few fringes ({p} px apart) – tilt the reference more "
+                                  "(aim for 5–20 px)."))
+        elif period < 3:
+            found.append(("poor", f"Fringes too dense ({p} px apart) – tilt the reference less "
+                                  "or remove binning."))
+        elif period > 20:
+            found.append(("fair", f"Fringes usable – but rather far apart ({p} px); tilt the "
+                                  "reference a little more (aim for 5–20 px)."))
+        elif period < 5:
+            found.append(("fair", f"Fringes usable – but very dense ({p} px apart); tilt the "
+                                  "reference a little less or remove binning."))
+    if contrast is not None:
+        c = f"{100 * contrast:.0f}"
+        if contrast < 0.15:
+            found.append(("poor", f"Very low fringe contrast ({c} %) – check exposure, focus "
+                                  "and alignment."))
+        elif contrast < 0.30:
+            found.append(("fair", f"Fringes usable – but contrast is low ({c} %); check exposure, "
+                                  "focus and alignment."))
+    for level in ("poor", "fair"):
+        for lvl, msg in found:
+            if lvl == level:
+                return lvl, msg
+    if snr is None and period is None and contrast is None:
+        return "unknown", ""
+    if period is not None:
+        msg = f"Fringes OK – {_fmt_px(period)} px apart"
+        if contrast is not None:
+            msg += f", contrast {100 * contrast:.0f} %"
+    elif contrast is not None:
+        msg = f"Fringe contrast {100 * contrast:.0f} %"
+    else:
+        msg = "Fringes OK"
+    return "good", msg
+
+
+def _region_mask(shape: tuple[int, int], region) -> np.ndarray:
+    """Boolean mask of the rectangle ``(x, y, w, h)``, clipped to ``shape``."""
+    h, w = shape
+    x, y, rw, rh = (int(round(float(v))) for v in region)
+    out = np.zeros(shape, dtype=bool)
+    x0, y0, x1, y1 = max(0, x), max(0, y), min(w, x + rw), min(h, y + rh)
+    if x1 > x0 and y1 > y0:
+        out[y0:y1, x0:x1] = True
+    return out
+
+
 def analyse(wrapped: np.ndarray, modulation: np.ndarray, cfg: PhaseConfig,
-            info: dict | None = None) -> PhaseResult:
+            info: dict | None = None, unwrapped: np.ndarray | None = None) -> PhaseResult:
+    """Mask, unwrap, level and convert a wrapped phase map.
+
+    ``unwrapped`` (e.g. ``PhaseResult.unwrapped`` of an earlier analysis with the same
+    ``unwrap`` and ``modulation_threshold``) skips the unwrapping, so changing only the
+    levelling or the output units is fast.
+    """
     t0 = time.perf_counter()
     info = dict(info or {})
     sample = modulation[:: max(1, modulation.shape[0] // 256), :: max(1, modulation.shape[1] // 256)]
     ref = float(np.nanpercentile(sample, 99)) or 1.0
     mask = modulation >= cfg.modulation_threshold * ref
-    unwrapped = unwrap(wrapped, cfg.unwrap, mask=mask, weights=modulation / ref)
+    if unwrapped is None:
+        unwrapped = unwrap(wrapped, cfg.unwrap, mask=mask, weights=modulation / ref)
+    else:
+        if np.shape(unwrapped) != np.shape(wrapped):
+            raise ValueError(f"unwrapped map has shape {np.shape(unwrapped)}, "
+                             f"the wrapped one {np.shape(wrapped)}")
+        unwrapped = np.asarray(unwrapped, dtype=np.float64)
     if cfg.unwrap == "none":
         base = np.asarray(wrapped, dtype=np.float64)
     else:
-        base = remove_background(unwrapped, cfg.detrend, mask)
+        fit_mask = mask
+        if cfg.level_region is not None and cfg.detrend != "none":
+            ref_area = mask & _region_mask(mask.shape, cfg.level_region) & np.isfinite(unwrapped)
+            if int(ref_area.sum()) >= 6:
+                fit_mask = ref_area
+                info["levelled_on"] = "reference area"
+            else:
+                info["level_note"] = ("reference area had too few valid pixels – "
+                                      "levelled on the whole image")
+        base = remove_background(unwrapped, cfg.detrend, fit_mask)
     values, quantity, unit = to_physical(base, cfg.output, cfg.wavelength_nm, cfg.n_sample,
                                          cfg.n_medium, cfg.thickness_um)
     physical = np.where(mask, values, np.nan).astype(np.float32)
@@ -494,13 +654,39 @@ def analyse(wrapped: np.ndarray, modulation: np.ndarray, cfg: PhaseConfig,
                        physical, np.asarray(modulation, np.float32), mask, quantity, unit, info, cfg)
 
 
-def analyse_frame(img: np.ndarray, cfg: PhaseConfig) -> PhaseResult:
-    """Fourier-transform method on a single interferogram."""
+MAX_CONTRAST = 1.5  # above this the intensity level cannot be a real (offset-free) intensity
+
+
+def _add_contrast(res: PhaseResult, intensity: np.ndarray) -> None:
+    """``info['contrast']`` = median valid modulation / median intensity.
+
+    Skipped when the intensity level is not positive or the ratio is impossibly
+    large (> MAX_CONTRAST), e.g. after background subtraction.
+    """
+    t0 = time.perf_counter()
+    if res.mask.any():
+        level = float(np.median(intensity))
+        if np.isfinite(level) and level > 0:
+            contrast = float(np.median(res.modulation[res.mask])) / level
+            if np.isfinite(contrast) and contrast <= MAX_CONTRAST:
+                res.info["contrast"] = contrast
+    res.info["seconds"] = res.info.get("seconds", 0.0) + time.perf_counter() - t0
+
+
+def analyse_frame(img: np.ndarray, cfg: PhaseConfig, raw: np.ndarray | None = None) -> PhaseResult:
+    """Fourier-transform method on a single interferogram.
+
+    ``raw`` is the unprocessed (cropped) camera frame; when it has the shape of
+    ``img`` its median is the intensity level for ``info['contrast']``.
+    """
     t0 = time.perf_counter()
     carrier = cfg.ftp_carrier if cfg.ftp_carrier != (0, 0) else None
     wrapped, mod, info = phase_from_fourier(img, carrier, cfg.ftp_filter_radius, cfg.ftp_dc_exclude)
     info.update(method="Fourier transform (single frame)", seconds=time.perf_counter() - t0)
-    return analyse(wrapped, mod, cfg, info)
+    res = analyse(wrapped, mod, cfg, info)
+    use_raw = raw is not None and np.shape(raw) == np.shape(img)
+    _add_contrast(res, np.asarray(raw) if use_raw else np.asarray(img))
+    return res
 
 
 def analyse_stack(frames, cfg: PhaseConfig) -> PhaseResult:
@@ -512,4 +698,7 @@ def analyse_stack(frames, cfg: PhaseConfig) -> PhaseResult:
                          "did the processing pipeline change during the sequence?")
     wrapped, mod, info = phase_from_steps(frames, cfg.method)
     info.update(method=ALGORITHMS[cfg.method].name, seconds=time.perf_counter() - t0)
-    return analyse(wrapped, mod, cfg, info)
+    res = analyse(wrapped, mod, cfg, info)
+    mean = sum(np.asarray(f, dtype=np.float64) for f in frames) / len(frames)
+    _add_contrast(res, mean)
+    return res

@@ -32,7 +32,19 @@ import numpy as np
 
 
 class CameraError(RuntimeError):
-    pass
+    """Camera or phase-shifter problem with a plain-language message.
+
+    ``kind`` lets the GUI offer specific help: "sdk_missing" (Thorlabs Python SDK
+    not installed), "dll" (Thorlabs native DLLs not found), "no_camera" (no camera
+    detected), "not_found" (requested camera not available; ``available`` lists
+    the serial numbers found), "port_missing" / "port_busy" (serial piezo port;
+    ``available`` lists the serial ports), or "" for anything else.
+    """
+
+    def __init__(self, message: str = "", kind: str = "", available: tuple = ()) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.available = tuple(available)
 
 
 # --------------------------------------------------------------------------
@@ -45,6 +57,8 @@ class CameraSource(ABC):
     supports_gain = False
     exposure_range_ms = (0.01, 1000.0)
     gain_range = (0.0, 0.0)
+    gain_decimals = 1  # decimals to show for the gain value
+    gain_unit = ""
 
     def open(self) -> None:  # pragma: no cover - trivial default
         pass
@@ -101,6 +115,7 @@ class SimulatedInterferometer(CameraSource):
     supports_gain = True
     exposure_range_ms = (0.05, 200.0)
     gain_range = (0.0, 24.0)
+    gain_unit = "dB"
 
     def __init__(self, width: int = 640, height: int = 480, wavelength_nm: float = 632.8,
                  tilt_fringes: tuple[float, float] = (55.0, 18.0), noise: float = 0.01,
@@ -229,13 +244,18 @@ class OpenCVCamera(CameraSource):
         self.cap = None
 
     def open(self) -> None:
-        import cv2
+        try:
+            import cv2
+        except ImportError as exc:
+            raise CameraError("OpenCV is not installed: pip install opencv-python-headless") from exc
         backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_ANY
         cap = cv2.VideoCapture(self.index, backend)
         if not cap.isOpened():
             cap = cv2.VideoCapture(self.index)
         if not cap.isOpened():
-            raise CameraError(f"cannot open OpenCV camera #{self.index}")
+            raise CameraError(f"Camera #{self.index} could not be opened. Check that it is plugged in, "
+                              "try another number, and close other programs that use it.",
+                              kind="not_found")
         if self.width:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         if self.height:
@@ -259,6 +279,15 @@ class OpenCVCamera(CameraSource):
         return f"{self.name} #{self.index}"
 
 
+_TSI_NATIVE = "Native_64_lib" if sys.maxsize > 2 ** 32 else "Native_32_lib"
+_TSI_DEFAULT_DLL_DIRS = tuple(
+    "\\".join((root, "Thorlabs", "Scientific Imaging", "Scientific Camera Support",
+               "Scientific Camera Interfaces", "SDK", "Native Toolkit", "dlls", _TSI_NATIVE))
+    for root in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                 os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+) if sys.platform.startswith("win") else ()
+
+
 class ThorlabsCamera(CameraSource):
     """Thorlabs scientific camera through the Thorlabs TSI Python SDK.
 
@@ -269,10 +298,17 @@ class ThorlabsCamera(CameraSource):
     On Windows the native DLLs must be findable: set the environment variable
     ``THORLABS_TSI_DLL_DIR`` to the folder containing ``thorlabs_tsi_camera_sdk.dll``
     (e.g. ``...\\Scientific Camera Interfaces\\SDK\\Native Toolkit\\dlls\\Native_64_lib``).
+    Without the variable the default ThorCam install folders are tried.
     """
 
     name = "Thorlabs camera (TSI SDK)"
     supports_exposure = True
+    gain_decimals = 0  # the TSI SDK gain is an integer index
+
+    DEFAULT_DLL_DIRS = _TSI_DEFAULT_DLL_DIRS
+    _DLL_HELP = ("The Thorlabs camera driver (DLL) could not be loaded. Set the environment variable "
+                 "THORLABS_TSI_DLL_DIR to the '...\\SDK\\Native Toolkit\\dlls\\" + _TSI_NATIVE
+                 + "' folder of ThorCam's Scientific Camera Interfaces and restart PhaseScope.")
 
     def __init__(self, serial: str | None = None, exposure_ms: float = 10.0) -> None:
         self.serial = serial
@@ -282,49 +318,114 @@ class ThorlabsCamera(CameraSource):
         self._shape = (0, 0)
         self._bit_depth = 12
 
-    @staticmethod
-    def _configure_dll_path() -> None:
+    @classmethod
+    def _configure_dll_path(cls) -> None:
         dll_dir = os.environ.get("THORLABS_TSI_DLL_DIR")
+        if not dll_dir:
+            dll_dir = next((d for d in cls.DEFAULT_DLL_DIRS if os.path.isdir(d)), None)
         if dll_dir and os.path.isdir(dll_dir):
-            os.environ["PATH"] = dll_dir + os.pathsep + os.environ.get("PATH", "")
+            path = os.environ.get("PATH", "")
+            if dll_dir not in path.split(os.pathsep):
+                os.environ["PATH"] = dll_dir + os.pathsep + path
             if hasattr(os, "add_dll_directory"):
-                os.add_dll_directory(dll_dir)
+                try:
+                    os.add_dll_directory(dll_dir)
+                except OSError:
+                    pass
 
     @classmethod
-    def list_cameras(cls) -> list[str]:
+    def _new_sdk(cls):
+        """Create a ``TLCameraSDK``; failures become a :class:`CameraError` with a ``kind``."""
         cls._configure_dll_path()
-        from thorlabs_tsi_sdk.tl_camera import TLCameraSDK
-        with TLCameraSDK() as sdk:
-            return list(sdk.discover_available_cameras())
-
-    def open(self) -> None:
-        self._configure_dll_path()
         try:
             from thorlabs_tsi_sdk.tl_camera import TLCameraSDK
         except ImportError as exc:
-            raise CameraError("Thorlabs SDK not installed: pip install the "
-                              "thorlabs_tsi_camera_python_sdk_package.zip from ThorCam") from exc
-        self.sdk = TLCameraSDK()
-        available = self.sdk.discover_available_cameras()
-        if not available:
-            self.sdk.dispose()
-            self.sdk = None
-            raise CameraError("no Thorlabs camera detected (is ThorCam closed and the camera connected?)")
-        serial = self.serial or available[0]
-        if serial not in available:
-            self.sdk.dispose()
-            self.sdk = None
-            raise CameraError(f"camera {serial} not found; available: {', '.join(available)}")
-        self.serial = serial
-        cam = self.sdk.open_camera(serial)
-        cam.exposure_time_us = int(self._initial_exposure_ms * 1000)
-        cam.frames_per_trigger_zero_for_unlimited = 0  # continuous mode
-        cam.image_poll_timeout_ms = 1000
+            if "dll" in str(exc).lower():
+                raise CameraError(cls._DLL_HELP, kind="dll") from exc
+            raise CameraError("The Thorlabs camera software for Python is not installed. Install "
+                              "thorlabs_tsi_camera_python_sdk_package.zip from the ThorCam folder "
+                              "with pip (see README).", kind="sdk_missing") from exc
+        except OSError as exc:
+            raise CameraError(cls._DLL_HELP, kind="dll") from exc
+        try:
+            return TLCameraSDK()
+        except Exception as exc:
+            text = str(exc)
+            low = text.lower()
+            if isinstance(exc, OSError) or "library" in low or "dll" in low:
+                raise CameraError(cls._DLL_HELP, kind="dll") from exc
+            if "in use" in low or "already" in low:
+                raise CameraError("The Thorlabs camera software is already in use by this program – "
+                                  "disconnect the open Thorlabs camera first.") from exc
+            raise CameraError(f"The Thorlabs camera software could not start: {text}") from exc
+
+    @classmethod
+    def list_cameras(cls, sdk=None) -> list[str]:
+        """Serial numbers of the connected cameras.
+
+        Pass an already open ``TLCameraSDK`` (e.g. the ``sdk`` of an open
+        ThorlabsCamera): the SDK allows only one instance per process.
+        """
+        if sdk is not None:
+            return [str(s) for s in sdk.discover_available_cameras()]
+        sdk = cls._new_sdk()
+        try:
+            return [str(s) for s in sdk.discover_available_cameras()]
+        finally:
+            sdk.dispose()
+
+    @staticmethod
+    def _poll_timeout_ms(exposure_ms: float) -> int:
+        return int(max(1000, 2 * exposure_ms + 500))
+
+    def _pick_serial(self, available: list[str]) -> str:
+        if not self.serial:
+            return available[0]
+        wanted = str(self.serial).strip()
+        if wanted in available:
+            return wanted
+        if wanted.isdigit() and len(wanted) <= 2 and int(wanted) < len(available):
+            return available[int(wanted)]  # small numbers are an index, like for OpenCV
+        raise CameraError(f"Thorlabs camera {wanted} was not found. Connected: "
+                          f"{', '.join(available)}.", kind="not_found", available=tuple(available))
+
+    def open(self) -> None:
+        sdk = self._new_sdk()
+        try:
+            available = [str(s) for s in sdk.discover_available_cameras()]
+            if not available:
+                raise CameraError("No Thorlabs camera was detected. Check the USB cable and close "
+                                  "ThorCam (only one program can use the camera at a time).",
+                                  kind="no_camera")
+            serial = self._pick_serial(available)
+            try:
+                cam = sdk.open_camera(serial)
+            except Exception as exc:
+                raise CameraError(f"Thorlabs camera {serial} could not be opened – close ThorCam or "
+                                  f"any other program that uses it. ({exc})") from exc
+            try:
+                self._configure(cam)
+            except Exception as exc:
+                try:
+                    cam.dispose()
+                except Exception:
+                    pass
+                raise CameraError(f"Thorlabs camera {serial} could not be started: {exc}") from exc
+        except Exception:
+            sdk.dispose()
+            raise
+        self.sdk, self.cam, self.serial = sdk, cam, serial
+
+    def _configure(self, cam) -> None:
         try:
             rng = cam.exposure_time_range_us
             self.exposure_range_ms = (rng.min / 1000.0, rng.max / 1000.0)
         except Exception:
             pass
+        exposure_ms = float(np.clip(self._initial_exposure_ms, *self.exposure_range_ms))
+        cam.exposure_time_us = int(exposure_ms * 1000)
+        cam.frames_per_trigger_zero_for_unlimited = 0  # continuous mode
+        cam.image_poll_timeout_ms = self._poll_timeout_ms(exposure_ms)
         try:
             g = cam.gain_range
             if g.max > g.min:
@@ -336,7 +437,6 @@ class ThorlabsCamera(CameraSource):
         self._shape = (cam.image_height_pixels, cam.image_width_pixels)
         cam.arm(2)
         cam.issue_software_trigger()
-        self.cam = cam
 
     def close(self) -> None:
         if self.cam is not None:
@@ -359,7 +459,12 @@ class ThorlabsCamera(CameraSource):
 
     def set_exposure_ms(self, value: float) -> None:
         lo, hi = self.exposure_range_ms
-        self.cam.exposure_time_us = int(np.clip(value, lo, hi) * 1000)
+        value = float(np.clip(value, lo, hi))
+        if self.cam is None:
+            self._initial_exposure_ms = value
+            return
+        self.cam.exposure_time_us = int(value * 1000)
+        self.cam.image_poll_timeout_ms = self._poll_timeout_ms(value)
 
     def get_exposure_ms(self) -> float | None:
         return self.cam.exposure_time_us / 1000.0 if self.cam is not None else None
@@ -418,8 +523,70 @@ class ManualShifter(PhaseShifter):
         pass
 
 
+def _natural_key(text: str) -> tuple:
+    import re
+    return tuple(int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", text))
+
+
+def list_serial_ports() -> list[tuple[str, str]]:
+    """``[(device, description)]`` of the serial ports on this computer ([] without pyserial)."""
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        return []
+    try:
+        ports = list_ports.comports()
+    except Exception:
+        return []
+    out = []
+    for p in ports:
+        desc = str(getattr(p, "description", "") or "")
+        out.append((str(p.device), "" if desc in ("n/a", p.device) else desc))
+    return sorted(out, key=lambda d: _natural_key(d[0]))
+
+
+_ESCAPES = {"r": "\r", "n": "\n", "t": "\t", "0": "\0", "\\": "\\"}
+_HEX = "0123456789abcdefABCDEF"
+
+
+def _as_typed(template: str) -> str:
+    """A command template for messages, with control characters shown as escapes."""
+    return str(template).replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+
+
+def decode_command(template: str) -> str:
+    r"""Turn the escapes ``\r \n \t \0 \\ \xHH`` typed in a command template into characters.
+
+    Real control characters (e.g. an actual carriage return) are kept as they are.
+    Raises :class:`CameraError` for an unknown or incomplete escape.
+    """
+    out, i, n = [], 0, len(template)
+    while i < n:
+        ch = template[i]
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        if i + 1 >= n:
+            raise CameraError(f"The piezo command '{_as_typed(template)}' ends with a lone backslash. "
+                              "Use \\r for a carriage return or \\\\ for a backslash.")
+        esc = template[i + 1]
+        if esc in _ESCAPES:
+            out.append(_ESCAPES[esc])
+            i += 2
+        elif esc == "x" and all(c in _HEX for c in template[i + 2:i + 4]) and i + 4 <= n:
+            out.append(chr(int(template[i + 2:i + 4], 16)))
+            i += 4
+        else:
+            shown = template[i + 1:i + 4] if esc == "x" else esc
+            raise CameraError(f"The piezo command '{_as_typed(template)}' contains the unknown escape "
+                              f"'\\{shown}'. Allowed: \\r (carriage return), \\n (line feed), \\t, "
+                              "\\0, \\xHH and \\\\ (backslash).")
+    return "".join(out)
+
+
 class SerialPiezoShifter(PhaseShifter):
-    """Piezo controller driven by ASCII commands over a serial port.
+    r"""Piezo controller driven by ASCII commands over a serial port.
 
     The voltage for a phase shift ``delta`` is
     ``offset_v + delta / (2 pi) * volts_per_2pi``.  Calibrate ``volts_per_2pi``
@@ -428,7 +595,9 @@ class SerialPiezoShifter(PhaseShifter):
 
     The default command template matches the Thorlabs MDT693B / MDT694B
     open-loop piezo controllers (``xvoltage=<V>``, 115200 baud); check your
-    controller manual and adapt ``command`` if needed.
+    controller manual and adapt ``command`` if needed.  The template may be
+    given as typed by the user, with ``\r`` / ``\n`` written as backslash
+    escapes (see :func:`decode_command`), or with the real characters.
     """
 
     name = "Serial piezo controller"
@@ -440,18 +609,65 @@ class SerialPiezoShifter(PhaseShifter):
         self.volts_per_2pi, self.offset_v, self.max_v = volts_per_2pi, offset_v, max_v
         self.ser = None
 
+    def command_bytes(self, delta_rad: float) -> bytes:
+        """The bytes sent for a phase shift; :class:`CameraError` for a bad command template."""
+        shown = _as_typed(self.command)
+        template = decode_command(str(self.command))
+        if "{volts" not in template:
+            raise CameraError(f"The piezo command '{shown}' has no {{volts}} placeholder – write e.g. "
+                              "xvoltage={volts:.3f}\\r so the voltage can be inserted.")
+        try:
+            text = template.format(volts=self.voltage_for(delta_rad))
+        except (KeyError, IndexError, ValueError, AttributeError, TypeError) as exc:
+            raise CameraError(f"The piezo command '{shown}' is not valid ({exc}). Use {{volts}} or "
+                              "{volts:.3f} where the voltage goes and nothing else in braces.") from exc
+        try:
+            return text.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise CameraError(f"The piezo command '{shown}' contains non-ASCII characters; the "
+                              "controller only understands plain ASCII text.") from exc
+
     def connect(self) -> None:
+        self.command_bytes(0.0)  # check the template before touching the port
         try:
             import serial  # pyserial
         except ImportError as exc:
             raise CameraError("pyserial is required: pip install pyserial") from exc
-        self.ser = serial.serial_for_url(self.port, baudrate=self.baudrate, timeout=0.5)
-        self.set_phase(0.0)
+        try:
+            self.ser = serial.serial_for_url(self.port, baudrate=self.baudrate, timeout=0.5,
+                                             write_timeout=2.0)
+        except (serial.SerialException, OSError, ValueError) as exc:
+            raise self._open_error(exc) from exc
+        try:
+            self.set_phase(0.0)
+        except Exception:
+            self.disconnect()
+            raise
+
+    def _open_error(self, exc: Exception) -> CameraError:
+        ports = tuple(d for d, _ in list_serial_ports())
+        listed = (f" Available ports: {', '.join(ports)}." if ports else
+                  " No serial ports were found – is the controller plugged in and switched on?")
+        low = str(exc).lower()
+        busy = ("permissionerror", "access is denied", "permission denied", "busy", "errno 13",
+                "errno 16", "exclusively lock")
+        missing = ("filenotfounderror", "no such file", "cannot find", "errno 2]", "does not exist")
+        if isinstance(exc, PermissionError) or any(m in low for m in busy):
+            return CameraError(f"{self.port} is in use by another program – close Kinesis/APT or "
+                               "any terminal.", kind="port_busy", available=ports)
+        if (isinstance(exc, FileNotFoundError) or any(m in low for m in missing)
+                or (ports and self.port.upper() not in {q.upper() for q in ports}
+                    and "://" not in self.port)):
+            return CameraError(f"Port {self.port} does not exist.{listed}", kind="port_missing",
+                               available=ports)
+        return CameraError(f"Could not open {self.port}: {exc}", available=ports)
 
     def disconnect(self) -> None:
         if self.ser is not None:
-            self.ser.close()
-            self.ser = None
+            try:
+                self.ser.close()
+            finally:
+                self.ser = None
 
     def voltage_for(self, delta_rad: float) -> float:
         v = self.offset_v + delta_rad / (2 * np.pi) * self.volts_per_2pi
@@ -460,6 +676,10 @@ class SerialPiezoShifter(PhaseShifter):
     def set_phase(self, delta_rad: float) -> None:
         if self.ser is None:
             raise CameraError("piezo controller is not connected")
-        self.ser.write(self.command.format(volts=self.voltage_for(delta_rad)).encode("ascii"))
-        self.ser.flush()
-        self.ser.reset_input_buffer()  # discard the echo / prompt
+        data = self.command_bytes(delta_rad)
+        try:
+            self.ser.write(data)
+            self.ser.flush()
+            self.ser.reset_input_buffer()  # discard the echo / prompt
+        except (OSError, ValueError) as exc:  # SerialException is an OSError
+            raise CameraError(f"Lost contact with the piezo controller on {self.port}: {exc}") from exc

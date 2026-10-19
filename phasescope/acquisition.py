@@ -450,10 +450,13 @@ class AcquisitionThread(QtCore.QThread):
         self._index += 1
         return raw
 
-    def _crop(self, raw: np.ndarray) -> np.ndarray:
-        if self.roi is None:
+    def _crop(self, raw: np.ndarray, roi: tuple[int, int, int, int] | None | bool = False) -> np.ndarray:
+        """Cut ``roi`` (default: the current region of interest) out of ``raw``."""
+        if roi is False:
+            roi = self.roi
+        if roi is None:
             return raw
-        x, y, w, h = self.roi
+        x, y, w, h = roi
         sub = raw[max(0, y):max(0, y) + h, max(0, x):max(0, x) + w]
         return sub if sub.size else raw
 
@@ -504,17 +507,17 @@ class AcquisitionThread(QtCore.QThread):
 
     def _run_sequence(self, seq_id: int) -> None:
         try:
-            cfg = self.config
+            cfg, roi = self.config, self.roi  # a new region applies from the next sequence
             p = self.pipeline
-            settings = (self.roi, p.signature(), p.bypass)
-            frames = self._record_sequence(cfg, seq_id)
+            settings = (roi, p.signature(), p.bypass)
+            frames = self._record_sequence(cfg, seq_id, roi)
             if frames is not None:
                 self._hand_off(frames, cfg, seq_id, settings)
         finally:
             with self._seq_lock:
                 self._active_id = None
 
-    def _record_sequence(self, cfg: PhaseConfig, seq_id: int) -> list[np.ndarray] | None:
+    def _record_sequence(self, cfg: PhaseConfig, seq_id: int, roi=None) -> list[np.ndarray] | None:
         """Step the phase and average the frames of each step; None when cancelled."""
         shifter = self.shifter
         if shifter is None:
@@ -540,7 +543,7 @@ class AcquisitionThread(QtCore.QThread):
                             raise CameraError("The camera stopped delivering images during the "
                                               "phase-stepping sequence (timeout).")
                         continue
-                    p = self.pipeline.apply(self._crop(raw), include_temporal=False)
+                    p = self.pipeline.apply(self._crop(raw, roi), include_temporal=False)
                     acc = p.astype(np.float64) if acc is None else acc + p
                     got += 1
                     self._publish(raw, p, step=f"{k + 1}/{len(shifts)}")

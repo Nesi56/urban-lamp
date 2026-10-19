@@ -453,6 +453,7 @@ def test_camera_error_while_calculating_keeps_the_map(app, win, monkeypatch):
     win.source.grab = broken
     assert _wait_for(app, lambda: win.thread is None, timeout=10)
     assert not win._pause_after_seq
+    assert "still calculating" in win.analysis_panel.message_label.text()
     assert _wait_for(app, lambda: win.last_result is not None, timeout=10)
     assert "finished" in _status(win)
 
@@ -559,4 +560,150 @@ def test_continuous_maps_carry_the_processing_of_their_sequence(app, win):
                      timeout=20)
     assert win._result_is_stale() == ""
     assert win._metadata()["result_pipeline"][0]["key"] == "gaussian"
+    win.continuous_btn.setChecked(False)
+
+
+def test_reverting_settings_during_a_failing_recalculation_clears_the_warning(app, win, monkeypatch):
+    import phasescope.gui as G
+    from phasescope.gui import OUTPUT_LABELS
+
+    _measure_once(app, win)
+    win.pause_live()
+    win.output_combo.setCurrentIndex(list(OUTPUT_LABELS).index("transmission"))
+    win.nsample_spin.setValue(1.5)
+    win.nmedium_spin.setValue(1.0)
+    assert _wait_for(app, lambda: win.last_result.config.output == "transmission" and not win._calc_busy)
+    _slow(monkeypatch, G, "analyse", 0.6)
+    win.nsample_spin.setValue(1.0)  # this recalculation will fail ...
+    assert _wait_for(app, lambda: win._calc_busy)
+    win.nsample_spin.setValue(1.5)  # ... and is undone while it runs
+    assert _wait_for(app, lambda: not win._calc_busy and not win._calc_reanalyse and not win._recalc_error,
+                     timeout=10)
+    assert not win.analysis_panel.banner_label.isVisibleTo(win) and win._result_is_stale() == ""
+
+
+def test_not_recalculated_banner_is_not_shown_over_the_camera_image(app, win):
+    from phasescope.gui import OUTPUT_LABELS
+
+    _measure_once(app, win)
+    win.pause_live()
+    win.output_combo.setCurrentIndex(list(OUTPUT_LABELS).index("transmission"))
+    win.nmedium_spin.setValue(1.0)
+    win.nsample_spin.setValue(1.0)
+    assert _wait_for(app, lambda: win._recalc_error != "", timeout=5)
+    banner = win.analysis_panel.banner_label
+    assert banner.isVisibleTo(win) and "Not recalculated" in banner.text()
+    win._set_channel("processed")
+    assert not banner.isVisibleTo(win)
+    win._set_channel("physical")
+    assert banner.isVisibleTo(win)
+
+
+def test_an_orphaned_map_never_replaces_a_newer_measurement(app, win, monkeypatch):
+    import phasescope.acquisition as acq
+    from phasescope.camera import CameraError
+
+    real, calls = acq.analyse_stack, []
+
+    def first_slow(frames, cfg):
+        calls.append(1)
+        if len(calls) == 1:
+            time.sleep(3.0)
+        return real(frames, cfg)
+
+    monkeypatch.setattr(acq, "analyse_stack", first_slow)
+    win.set_mode("measure")
+    win.last_result = None
+    win.acquire_sequence()
+    assert _wait_for(app, lambda: win.thread is not None and win.thread.analysing, timeout=10)
+    grab = win.source.grab
+
+    def broken():
+        raise CameraError("USB transfer failed")
+
+    win.source.grab = broken
+    assert _wait_for(app, lambda: win.thread is None, timeout=10)
+    win.source.grab = grab
+    win.start_live()
+    win.acquire_sequence()
+    assert _wait_for(app, lambda: win.last_result is not None, timeout=10)
+    newer = win.last_result
+    _pump(app, 3.0)  # the first analysis ends meanwhile
+    assert win.last_result is newer
+
+
+def test_camera_error_ends_continuous_stepping(app, win):
+    from phasescope.camera import CameraError
+
+    win.set_mode("measure")
+    win.continuous_btn.setChecked(True)
+    assert _wait_for(app, lambda: win._seq_progress[0] >= 1, timeout=10)
+
+    def broken():
+        raise CameraError("USB transfer failed")
+
+    win.source.grab = broken
+    assert _wait_for(app, lambda: win.thread is None, timeout=10)
+    assert not win.act_continuous.isChecked() and not win.continuous_btn.isChecked()
+
+
+def test_long_multipage_tiff_shows_its_first_page(app, win, tmp_path, monkeypatch):
+    import cv2
+
+    import phasescope.gui as G
+
+    if not hasattr(cv2, "imwritemulti"):
+        pytest.skip("OpenCV without multi-page TIFF support")
+    pages = [np.full((24, 32), k, np.uint16) for k in range(20)]
+    path = str(tmp_path / "series.tif")
+    assert cv2.imwritemulti(path, pages)
+    assert len(G.load_pages(path)) == G.MAX_SEQUENCE + 1  # decoding stops early
+    win.load_images([path])
+    assert win.source.describe().startswith("Image file") or win.live_title.text() == "Image file"
+    assert "more than 16 pages" in _status(win)
+
+    problems = []
+    monkeypatch.setattr(win, "_problem", lambda title, *a, **k: problems.append(title))
+    single = str(tmp_path / "single.tif")
+    cv2.imwrite(single, pages[0])
+    win.load_images([path, single])
+    assert problems and "stack" in problems[0]
+
+
+def test_saved_info_names_the_camera_for_a_new_frame_and_the_files_for_the_map(app, win, tmp_path):
+    import cv2
+
+    frames = []
+    for k in range(4):
+        win.source.set_phase_shift(k * np.pi / 2)
+        frames.append(win.source.grab())
+    paths = []
+    for k, f in enumerate(frames):
+        paths.append(str(tmp_path / f"step{k + 1}.tif"))
+        cv2.imwrite(paths[-1], f)
+    win.load_images(paths)
+    assert win._metadata()["source"].startswith("files:")
+    win.start_live()
+    assert _wait_for(app, lambda: win._packet_files is None, timeout=5)
+    meta = win._metadata()
+    assert not meta["source"].startswith("files:") and meta["result_source"].startswith("files: step1.tif")
+
+
+def test_save_dialog_keeps_other_writable_types(app, win, monkeypatch):
+    from pyqtgraph.Qt import QtWidgets
+
+    from phasescope.gui import ARRAY_FILES
+
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: ("/data/map.npy", "")))
+    assert win._save_dialog("t", "x", "All maps (*.npz)", writable=ARRAY_FILES + (".npz",)) == "/data/map.npy"
+
+
+def test_continuous_after_a_cancel_shows_step_progress(app, win):
+    win.set_mode("measure")
+    win.acquire_sequence()
+    win.cancel_sequence()
+    assert win.step_progress.format() == "cancelled"
+    win.continuous_btn.setChecked(True)
+    assert win.step_progress.format() == "step %v / %m"
     win.continuous_btn.setChecked(False)

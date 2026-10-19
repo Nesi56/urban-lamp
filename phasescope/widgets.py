@@ -130,6 +130,14 @@ def _place_banner(label: QtWidgets.QLabel, area: QtCore.QRect) -> None:
     label.raise_()
 
 
+def _popup_raiser(menu: QtWidgets.QMenu):
+    """Handler for pyqtgraph's context-menu hooks that opens ``menu`` at the click."""
+    def raise_menu(ev) -> None:
+        pos = ev.screenPos()
+        menu.popup(QtCore.QPoint(int(pos.x()), int(pos.y())))
+    return raise_menu
+
+
 def _set_overlay_text(label: QtWidgets.QLabel, text: str | None) -> bool:
     """Show ``text`` in ``label`` (None/empty hides it); True when it needs placing."""
     if not text:
@@ -389,26 +397,25 @@ class ImagePanel(QtWidgets.QWidget):
     def set_popup_menu(self, menu: QtWidgets.QMenu) -> None:
         """Right click on the image, its margins, the colour bar, the boxes and the profile line
         opens ``menu`` (in place of pyqtgraph's View All / Axis / Export and gradient menus)."""
+        # the handlers hold only the menu: a bound method of the panel stored on its own child items
+        # would make every panel a reference cycle, and PySide6 can crash when the GC frees one
         self.image.popup_menu = menu
         self._popup = menu
-        self.vb.raiseContextMenu = self._raise_popup
+        self.vb.raiseContextMenu = _popup_raiser(menu)
         if self.hist is not None:
-            self.hist.vb.raiseContextMenu = self._raise_popup
-            self.hist.gradient.showMenu = self._raise_popup  # its presets would bypass the Colours box
+            self.hist.vb.raiseContextMenu = _popup_raiser(menu)
+            self.hist.gradient.showMenu = _popup_raiser(menu)  # its presets would bypass the Colours box
         for item in (self.roi_item, self.profile_line):
             if item is not None:
                 self.add_popup_item(item)
 
     def add_popup_item(self, roi: pg.ROI) -> None:
-        """Let a box or line drawn on the image open the panel's menu on a right click."""
-        roi.contextMenuEnabled = lambda: getattr(self, "_popup", None) is not None
-        roi.raiseContextMenu = self._raise_popup
-
-    def _raise_popup(self, ev) -> None:
+        """Let a box or line drawn on the image open the panel's menu on a right click
+        (call after set_popup_menu)."""
         menu = getattr(self, "_popup", None)
         if menu is not None:
-            pos = ev.screenPos()
-            menu.popup(QtCore.QPoint(int(pos.x()), int(pos.y())))
+            roi.contextMenuEnabled = lambda: True
+            roi.raiseContextMenu = _popup_raiser(menu)
 
     def set_colormap(self, name: str) -> None:
         self._cmap_name = name

@@ -470,3 +470,19 @@ def test_new_phase_worker_waits_for_an_abandoned_one_without_blocking(app, make_
     w = th._ensure_worker()
     assert w is not None and w.is_alive()
     th._stop_worker()
+
+
+def test_region_changed_during_a_sequence_applies_to_the_next_one(app, make_thread):
+    cam = _sim(animate=False)
+    th = make_thread(cam, PhaseConfig(method="4step", settle_ms=120), SimulatedShifter(cam))
+    events = _sequence_events(th)
+    progress = []
+    th.sequence_progress.connect(lambda seq, k, n: progress.append(k))
+    th.start()
+    sid = th.request_sequence()
+    assert _wait_for(app, lambda: progress)
+    th.roi = (10, 10, 64, 48)  # e.g. 'Analyse only the yellow box' ticked mid-sequence
+    assert _wait_for(app, lambda: events)
+    assert events == [(sid, True, "")]
+    res = th.take_phase()
+    assert res.physical.shape == (144, 192) and res.info["sequence_settings"][0] is None

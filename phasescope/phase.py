@@ -695,7 +695,7 @@ def analyse_stack(frames, cfg: PhaseConfig) -> PhaseResult:
     shapes = {np.shape(f) for f in frames}
     if len(shapes) != 1:
         raise ValueError(f"phase-step frames have different shapes {sorted(shapes)} - "
-                         "did the processing pipeline change during the sequence?")
+                         "did the processing or the analysed region change during the sequence?")
     wrapped, mod, info = phase_from_steps(frames, cfg.method)
     info.update(method=ALGORITHMS[cfg.method].name, seconds=time.perf_counter() - t0)
     res = analyse(wrapped, mod, cfg, info)

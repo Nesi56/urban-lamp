@@ -97,6 +97,8 @@ SERIAL_PARAMS = (
 
 IMAGE_FILTER = "Images (*.png *.tif *.tiff *.bmp *.jpg *.jpeg *.npy);;All files (*)"
 MEASUREMENT_FILES = ("_raw.tif", "_map.tif", "_maps.npz", "_view.png", "_info.txt")  # one measurement
+MAX_SEQUENCE = 16  # most images in a phase-stepping sequence
+ARRAY_FILES = (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp", ".npy", ".csv", ".txt")  # save_array writes these
 SDK_ZIP = (r"C:\Program Files\Thorlabs\Scientific Imaging\Scientific Camera Support\Scientific Camera Interfaces"
            r"\SDK\Python Toolkit\thorlabs_tsi_camera_python_sdk_package.zip")
 
@@ -119,23 +121,45 @@ def load_image(path: str) -> np.ndarray:
     return _as_image(img, name)
 
 
-def load_pages(path: str) -> list[np.ndarray]:
-    """All images in ``path``: every page of a multi-page TIFF (e.g. a phase-step stack), else one."""
-    if path.lower().endswith((".tif", ".tiff")) and os.path.getsize(path) > 0:
-        name = os.path.basename(path)
-        pages = None
+def load_pages(path: str, limit: int = MAX_SEQUENCE + 1) -> list[np.ndarray]:
+    """The images in ``path``: the pages of a multi-page TIFF (e.g. a phase-step stack), else the
+    one image.  At most ``limit`` pages are decoded, so a long time series is refused quickly."""
+    if not path.lower().endswith((".tif", ".tiff")) or os.path.getsize(path) == 0:
+        return [load_image(path)]
+    name = os.path.basename(path)
+    count = None
+    if path.isascii() and hasattr(cv2, "imcount"):
         try:
-            if hasattr(cv2, "imdecodemulti"):  # OpenCV >= 4.7, also for non-ASCII paths
-                ok, pages = cv2.imdecodemulti(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
-            elif path.isascii():
-                ok, pages = cv2.imreadmulti(path, flags=cv2.IMREAD_UNCHANGED)
-            else:
-                ok = False
+            count = int(cv2.imcount(path))  # reads no pixels
         except cv2.error:
-            ok = False
-        if ok and pages is not None and len(pages) > 1:
-            return [_as_image(page, f"{name} (page {i + 1})") for i, page in enumerate(pages)]
-    return [load_image(path)]
+            count = None
+    if count is not None and count <= 1:
+        return [load_image(path)]
+    pages = _decode_pages(path, limit)
+    if count is not None and len(pages) < min(count, limit):
+        raise IOError(f"{name} seems damaged: only {len(pages)} of its {count} pages could be read")
+    if len(pages) <= 1:
+        return [load_image(path)]
+    return [_as_image(page, f"{name} (page {i + 1})") for i, page in enumerate(pages)]
+
+
+def _decode_pages(path: str, limit: int) -> list:
+    """Up to ``limit`` decoded pages of a TIFF ([] when this OpenCV cannot read several pages)."""
+    flags = cv2.IMREAD_UNCHANGED
+    try:
+        if hasattr(cv2, "imdecodemulti"):  # OpenCV >= 4.7, also for non-ASCII paths
+            buf = np.fromfile(path, dtype=np.uint8)
+            try:
+                ok, pages = cv2.imdecodemulti(buf, flags, None, (0, limit))
+            except (TypeError, cv2.error):  # no page range in this version
+                ok, pages = cv2.imdecodemulti(buf, flags)
+        elif path.isascii():
+            ok, pages = cv2.imreadmulti(path, flags=flags)
+        else:
+            return []
+    except cv2.error:
+        return []
+    return list(pages)[:limit] if ok and pages is not None else []
 
 
 def _as_image(img, name: str) -> np.ndarray:
@@ -281,6 +305,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._calc_kind = ""  # kind of the running calculation ('manual' or 'reanalyse')
         self._recalc_error = ""  # why the last recalculation of the shown map failed
         self._result_files: list[str] | None = None  # files the shown map was computed from
+        self._packet_files: list[str] | None = None  # files last_packet came from (None: the camera)
+        self._calc_original = None  # map the running recalculation started from
+        self._serial_note = ""
         self._orphan = None  # (thread, seq id, context) of a camera thread that ended while its map was calculated
         self._seq_progress = (0, 0)  # steps recorded / in the sequence
         self._calc_queue: list = []  # manual-stepping analyses waiting (never dropped)
@@ -625,7 +652,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for key, label in CHANNELS.items():
             self.channel_combo.addItem(label, key)
         self.channel_combo.setToolTip("What the analysis area shows")
-        self.channel_combo.currentIndexChanged.connect(lambda _: self._update_analysis(force=True))
+        self.channel_combo.currentIndexChanged.connect(lambda _: self._channel_changed())
         bar.addWidget(self.channel_combo, 1)
         bar.addWidget(QtWidgets.QLabel("Colours"))
         self.cmap_combo = QtWidgets.QComboBox()
@@ -1549,10 +1576,16 @@ class MainWindow(QtWidgets.QMainWindow):
         th = self.thread
         if th is not None and not th.isRunning():
             self.thread = None
+            continuous = self.act_continuous.isChecked()
+            self._set_continuous(False)  # F5 must not resume stepping unseen
+            note = " Continuous stepping ended." if continuous else ""
             if self._recording and th.analysing and self._seq_id >= 0:
-                # the camera gave up, but the recorded sequence is still being calculated: keep its map
-                self._orphan = (th, self._seq_id, self._seq_context)
-                self._notify("Camera stopped - the recorded sequence is still being calculated…", 15000)
+                # the camera gave up, but the recorded sequence is still being calculated: keep its map,
+                # unless something newer is shown by then
+                self._orphan = (th, self._seq_id, self._seq_context, self.last_result)
+                self._notify("Camera stopped - the recorded sequence is still being calculated…" + note, 15000)
+            elif continuous:
+                self._notify("Camera stopped -" + note, 15000)
             self._recording = False
             self._pause_after_seq = False
             self._seq_id = -1
@@ -1569,12 +1602,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _orphan_finished(self, seq_id: int, ok: bool, reason: str) -> None:
         """The map of a sequence recorded before the camera stopped is ready (or failed)."""
-        th, wanted, context = self._orphan
+        th, wanted, context, shown = self._orphan
         if seq_id != wanted:
             return
         self._orphan = None
         res = th.take_phase() if ok else None
-        if res is not None and res.config is not None and not self._hold and \
+        newer = self.last_result is not shown or self._recording or self._calc_kind == "manual"
+        if res is not None and newer:
+            self._notify("An earlier measurement (recorded before the camera stopped) finished - not shown, "
+                         "as a newer one is on screen", 10000)
+        elif res is not None and res.config is not None and not self._hold and \
                 (res.config.method, res.config.n_steps) == (self.phase_cfg.method, self.phase_cfg.n_steps):
             self._show_result(res, context=self._sequence_context(res, context))
             self._notify(f"{self._seq_method or 'Phase'} measurement finished (the camera stopped afterwards)", 10000)
@@ -1582,6 +1619,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._notify(f"Measurement aborted: {reason}", 12000)
         else:
             self._notify("Measurement discarded - the camera stopped while the map was calculated", 10000)
+        self._refresh_empty_hint()
+
+    def _drop_orphan(self) -> None:
+        """A new measurement starts: a map still calculated for the stopped camera is not wanted."""
+        self._orphan = None
 
     def _run_on_camera(self, fn) -> None:
         if self.thread is not None and self.thread.isRunning():
@@ -1747,6 +1789,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if pkt is not None:
             first = self.last_packet is None
             self.last_packet = pkt
+            self._packet_files = None
             self._packet_thread = th
             self._last_frame_t = now
             if self._state in ("stalled", "connecting") or (first and self._state != "error"):
@@ -1968,11 +2011,13 @@ class MainWindow(QtWidgets.QMainWindow):
             text = "Waiting for fringes…\nTilt the reference mirror until straight fringes 5–20 px apart appear."
             return text + (f"\n\n({err})" if err else "")
         n = len(cfg.shifts())
+        if self._orphan is not None:
+            return "Camera stopped - still calculating the recorded sequence…"
         if self._recording:
             k, total = self._seq_progress
             if total and k >= total:
                 return "Calculating the map…"
-            return f"Recording {n} phase-shifted frames… (step {min(k + 1, n)} of {n})"
+            return f"Recording {n} phase-shifted frames… ({min(k, n)} of {n} recorded)"
         if self._calc_busy and self._calc_kind == "manual":
             return "All steps captured - calculating the map…"
         if isinstance(self.shifter, ManualShifter):
@@ -2097,18 +2142,31 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.ftp_hint.setText(message)
         else:
             self.fringe_pill.hide()
-        note = res.info.get("level_note")
-        if level == "poor":
-            self.analysis_panel.set_banner(f"Result unreliable - {message}", "warn")
-        elif note:
-            self.analysis_panel.set_banner(note.capitalize(), "warn")
-        elif self._hold:
-            self.analysis_panel.set_banner("Held - live map frozen (press H or Resume)", "info")
-        else:
-            self.analysis_panel.set_banner(None)
+        self._refresh_result_banner()
         self._refresh_stale_badge()
         if self._channel() not in IMAGE_CHANNELS:
             self._update_analysis()
+
+    def _refresh_result_banner(self) -> None:
+        """Warning strip over the map: unreliable, levelling note, not recalculated, or held."""
+        r, text, kind = self.last_result, None, "warn"
+        if r is not None and self._channel() not in IMAGE_CHANNELS:  # not over the camera image
+            level, message = fringe_quality(r.info)
+            note = r.info.get("level_note")
+            if self._recalc_error:
+                text = f"Not recalculated - {self._recalc_error}"
+            elif level == "poor":
+                text = f"Result unreliable - {message}"
+            elif note:
+                text = note.capitalize()
+        if text is None and self._hold:
+            text, kind = "Held - live map frozen (press H or Resume)", "info"
+        self.analysis_panel.set_banner(text, kind)
+
+    def _channel_changed(self) -> None:
+        self._update_analysis(force=True)
+        self._refresh_result_banner()
+        self._refresh_stale_badge()
 
     def _result_is_stale(self) -> str:
         r = self.last_result
@@ -2134,7 +2192,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_stale_badge(self) -> None:
         reason = self._result_is_stale()
         r = self.last_result
-        if reason.startswith("not recalculated") and r is not None:
+        if r is not None and self._calc_busy and self._calc_kind == "reanalyse" and self._calc_original is r:
+            self.stale_pill.set_state("info", "Recalculating…", "The map is being recalculated with the new settings.")
+            self.stale_pill.show()
+        elif reason.startswith("not recalculated") and r is not None:
             self.stale_pill.set_state("warn", "Not recalculated",
                                       f"The map still uses the earlier settings: {self._recalc_error}")
             self.stale_pill.show()
@@ -2142,9 +2203,6 @@ class MainWindow(QtWidgets.QMainWindow):
             when = time.strftime("%H:%M:%S", time.localtime(r.timestamp))
             self.stale_pill.set_state("muted", f"Earlier result · {when}",
                                       f"This map is from {when} ({reason}). It is kept so you can still save it.")
-            self.stale_pill.show()
-        elif r is not None and self._calc_busy and self._calc_kind == "reanalyse":
-            self.stale_pill.set_state("info", "Recalculating…", "The map is being recalculated with the new settings.")
             self.stale_pill.show()
         else:
             self.stale_pill.hide()
@@ -2623,10 +2681,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_hold.blockSignals(False)
         if self.thread is not None:
             self.thread.hold = self._hold  # no live maps are computed while held
-        if self._hold:
-            self.analysis_panel.set_banner("Held - live map frozen (press H or Resume)", "info")
-        else:
-            self.analysis_panel.set_banner(None)
+        self._refresh_result_banner()
         self._update_controls()
 
     def _shifter_changed(self, connect: bool = True, user: bool = False) -> None:
@@ -2639,6 +2694,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cancel_sequence("Measurement cancelled - the phase shifter was changed")
         if self._fallback is not None:  # the user's own choice wins over the remembered one
             self._fallback = (self._fallback[0], key)
+        if key != "serial" and self._serial_note and self.statusBar().currentMessage() == self._serial_note:
+            self.statusBar().clearMessage()
         self._progress_note = ""
         self.step_progress.setValue(0)
         if self.shifter is not None:
@@ -2669,8 +2726,9 @@ class MainWindow(QtWidgets.QMainWindow):
             status = f"Not connected ({self.serial_settings['port']}) - press Connect"
             if user:  # chosen from a menu maybe: show where to connect it
                 self._raise_dock(self.phase_dock)
-                self._notify(f"Serial piezo selected - press Connect in the Phase tab (port "
-                             f"{self.serial_settings['port']}), or Settings… to choose the port", 10000)
+                self._serial_note = (f"Serial piezo selected - press Connect in the Phase tab (port "
+                                     f"{self.serial_settings['port']}), or Settings… to choose the port")
+                self._notify(self._serial_note, 10000)
         self.shifter = shifter
         self.shifter_status.setText(status)
         if self.thread is not None:
@@ -2756,6 +2814,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.progress.setRange(0, len(self.phase_cfg.shifts()))
             self.progress.setValue(0)
             self.progress.show()
+            self._drop_orphan()
             self._seq_method = ALGORITHMS[self.phase_cfg.method].name
             self._seq_context = self._context()
             self._seq_progress = (0, len(self.phase_cfg.shifts()))
@@ -2791,6 +2850,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.phase_cfg.is_stepping:
             self.set_mode("measure")
         self._set_continuous(True)
+        self._drop_orphan()
         self._seq_method = ALGORITHMS[self.phase_cfg.method].name
         self._seq_started = time.monotonic()
         self._seq_context = self._context()
@@ -2801,6 +2861,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._seq_id = self.thread.sequence_id
         self._recording = True
         self._progress_note = ""
+        n = len(self.phase_cfg.shifts())
+        for bar in (self.step_progress, self.progress):
+            bar.setRange(0, n)
+            bar.setValue(0)
+        self.step_progress.setFormat("step %v / %m")  # not 'cancelled' / 'failed' of an earlier run
         self.progress.show()
         self._update_controls()
 
@@ -2883,6 +2948,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.thread is None or self.last_packet is None:
             self._notify("Start the live camera first (F5)")
             return
+        self._drop_orphan()
         self._capture = {"target": max(1, cfg.frames_per_step), "got": 0, "acc": None,
                          "not_before": time.monotonic() + cfg.settle_ms / 1000.0,
                          "skip": cfg.discard_frames, "after": self._current_index()}
@@ -2948,9 +3014,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._notify("No map to recalculate yet")
             return
         r = self.last_result
-        if only_if_needed and r.config is not None and \
+        if only_if_needed and not self._recalc_error and r.config is not None and \
                 replace(self.phase_cfg, method=r.config.method, n_steps=r.config.n_steps) == r.config:
-            return  # the map already uses the current settings
+            return  # the map already uses the current settings (after a failure: run it to clear that)
         if self._calc_busy:
             self._calc_reanalyse = True  # done after the running job, on the newest map and settings
             return
@@ -2976,10 +3042,12 @@ class MainWindow(QtWidgets.QMainWindow):
         """Run one phase calculation in a background thread (only one at a time - they are big)."""
         self._calc_busy = True
         self._calc_kind = kind
+        self._calc_original = meta.get("original")
         self._job_serial += 1
         job = self._job_serial
         self._notify("Calculating…", 0)  # until the calculation is done
         self._refresh_stale_badge()
+        self._refresh_empty_hint()
 
         def work():
             try:
@@ -2996,6 +3064,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _next_calculation(self) -> None:
         self._calc_busy = False
         self._calc_kind = ""
+        self._calc_original = None
         if self._calc_queue:
             kind, fn, meta = self._calc_queue.pop(0)
             self._start_calculation(kind, fn, **meta)
@@ -3034,7 +3103,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._notify(f"Recalculation failed: {err}", 8000)
                 self._recalc_error = err  # the map on screen does not match the panel settings
                 self._refresh_stale_badge()
-                self.analysis_panel.set_banner(f"Not recalculated - {err}", "warn")
+                self._refresh_result_banner()
                 return
             res.timestamp = r.timestamp
             if r.config is not None:  # the settings the job used, with the method the map was recorded with
@@ -3054,11 +3123,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self.load_images(sorted(paths, key=lambda p: _natural_key(os.path.basename(p))))
 
     def load_images(self, paths: list[str]) -> None:
-        try:  # a multi-page TIFF counts as a sequence of its pages
-            images = [img for p in paths for img in load_pages(p)]
+        try:  # a multi-page TIFF on its own is a sequence of its pages
+            stacks = [load_pages(p) for p in paths]
         except Exception as exc:
             self._problem("The image could not be opened.", str(exc), [])
             return
+        if len(paths) > 1 and any(len(pages) > 1 for pages in stacks):
+            name = next(os.path.basename(p) for p, pages in zip(paths, stacks) if len(pages) > 1)
+            self._problem("Cannot mix a stack with other images.",
+                          f"{name} already holds several images. Open a multi-page file on its own, "
+                          "or select single images only.", [])
+            return
+        images = [img for pages in stacks for img in pages]
+        if len(paths) == 1 and len(images) > MAX_SEQUENCE:  # e.g. a time series: show its first page
+            images = images[:1]
+            self._notify(f"{os.path.basename(paths[0])} has more than {MAX_SEQUENCE} pages - showing the "
+                         "first page only (a phase-stepping sequence has 3 to 16 images)", 12000)
         if len(images) == 1:
             self.disconnect_camera()
             self.source_key = "file"
@@ -3066,12 +3146,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.start_live()
             return
         n = len(images)  # several images: a phase-stepping sequence
-        if not 3 <= n <= 16:
+        if not 3 <= n <= MAX_SEQUENCE:
             self._problem("Cannot use these images as a sequence.",
-                          f"A phase-stepping sequence needs 3 to 16 images; "
+                          f"A phase-stepping sequence needs 3 to {MAX_SEQUENCE} images; "
                           f"{'you selected' if len(paths) > 1 else 'the file contains'} {n}.", [])
             return
         cfg = self.phase_cfg
+        switched = ""
         if not cfg.is_stepping or len(cfg.shifts()) != n:
             key = {3: "3step", 4: "4step", 5: "5step"}.get(n, "nstep")
             self._sync = True
@@ -3080,6 +3161,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._sync = False
             self._phase_widgets_changed()  # rebuild the settings from the widgets explicitly
             cfg = self.phase_cfg
+            switched = f" - analysed as {ALGORITHMS[key].name}"
         try:
             frames = [self.pipeline.apply(img, include_temporal=False) for img in images]
             res = analyse_stack(frames, cfg)
@@ -3092,9 +3174,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.live_panel.set_message(None)
         self.last_packet = FramePacket(images[0], frames[0], 0, 0.0, 0.0)
         names = [os.path.basename(p) for p in paths]
+        self._drop_orphan()
         self.live_info.setText(f"{n}-frame sequence: {names[0]}{' …' if len(names) > 1 else ''}")
+        self._packet_files = names
         self._set_channel("physical")
         self._show_result(res, files=names)
+        self._notify(f"{n} images from {names[0] if len(names) == 1 else f'{len(names)} files'}{switched}", 10000)
 
     def _save_folder(self) -> str:
         if self.settings is not None:
@@ -3134,8 +3219,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def save_measurement_as(self) -> None:
         default = os.path.join(self._save_folder(), self._base_name())
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save measurement as", default,
-                                                        "Measurement (*_info.txt);;All files (*)")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save measurement as", default, "Measurement (*_info.txt);;All files (*)",
+            options=QtWidgets.QFileDialog.Option.DontConfirmOverwrite)  # asked below, for the whole set
         if not path:
             return
         base = next((path[:-len(suf)] for suf in MEASUREMENT_FILES if path.lower().endswith(suf)), None)
@@ -3160,10 +3246,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 "pipeline": [{"step": s.label, "key": s.op.key, "params": s.params, "enabled": s.enabled}
                              for s in self.pipeline.steps],
                 "phase_settings": asdict(self.phase_cfg)}
+        if self._packet_files:  # the raw frame came from files, not from the camera
+            meta.update(source="files: " + ", ".join(self._packet_files), exposure_ms=None, gain=None)
         r = self.last_result
-        if r is not None and self._result_files:  # computed from files, not from the camera
-            meta.update(source="files: " + ", ".join(self._result_files), exposure_ms=None, gain=None)
         if r is not None:
+            meta["result_source"] = ("files: " + ", ".join(self._result_files) if self._result_files
+                                     else meta["source"])
             if r.config is not None:
                 meta["result_settings"] = asdict(r.config)  # the settings this map was computed with
             if self._result_context is not None:
@@ -3228,12 +3316,11 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.restoreOverrideCursor()
         self._notify(f"Saved {len(written)} files as {os.path.basename(base_path)} in {folder}", 8000)
 
-    def _save_dialog(self, title: str, name: str, filters: str) -> str:
+    def _save_dialog(self, title: str, name: str, filters: str, writable=ARRAY_FILES) -> str:
+        """Ask for a file name; add the selected type unless one of ``writable`` was typed."""
         path, chosen = QtWidgets.QFileDialog.getSaveFileName(self, title, os.path.join(self._save_folder(), name),
                                                              filters)
-        exts = {e.lower() for e in re.findall(r"\*(\.\w+)", filters)}
-        if ".tif" in exts:
-            exts.add(".tiff")
+        exts = {e.lower() for e in re.findall(r"\*(\.\w+)", filters)} | set(writable)
         if path and os.path.splitext(path)[1].lower() not in exts:  # e.g. 'Si_0.5um': add the selected type
             m = re.search(r"\*(\.\w+)", chosen or filters)
             path += m.group(1) if m else ""
@@ -3266,7 +3353,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         path = self._save_dialog("Save phase result", self._base_name() + "_maps.npz",
                                  "All maps + metadata (*.npz);;Map as TIFF (*.tif);;Map as CSV (*.csv);;"
-                                 "Map as PNG (*.png)")
+                                 "Map as PNG (*.png)", writable=ARRAY_FILES + (".npz",))
         if not path:
             return
         if path.lower().endswith(".npz"):
@@ -3278,7 +3365,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._try(lambda: save_array(path, r.physical), f"Saved {path}")
 
     def save_view(self, panel) -> None:
-        path = self._save_dialog("Save view", self._base_name() + "_view.png", "PNG (*.png)")
+        formats = tuple("." + f.data().decode() for f in QtGui.QImageWriter.supportedImageFormats())
+        path = self._save_dialog("Save view", self._base_name() + "_view.png", "PNG (*.png)", writable=formats)
         if path:
             self._try(lambda: _check_written(panel.grab_image().save(path), path), f"Saved {path}")
 

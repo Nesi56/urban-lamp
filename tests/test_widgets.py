@@ -562,10 +562,32 @@ def test_colour_bar_and_boxes_open_the_panel_menu(app):
 
     from phasescope.widgets import ImagePanel
 
+    import gc
+    import weakref
+
+    class Click:
+        def screenPos(self):
+            return QtCore.QPointF(10, 20)
+
     panel = ImagePanel(histogram=True, profile=True, roi=True)
     menu = QtWidgets.QMenu()
+    opened = []
+    menu.popup = lambda pos: opened.append((pos.x(), pos.y()))
     panel.set_popup_menu(menu)
-    assert panel.hist.gradient.showMenu == panel._raise_popup  # no pyqtgraph gradient presets
-    assert panel.hist.vb.raiseContextMenu == panel._raise_popup
+    hooks = [panel.vb.raiseContextMenu, panel.hist.vb.raiseContextMenu,
+             panel.hist.gradient.showMenu]  # no pyqtgraph gradient presets
     for item in (panel.roi_item, panel.profile_line):
-        assert item.contextMenuEnabled() and item.raiseContextMenu == panel._raise_popup
+        assert item.contextMenuEnabled()
+        hooks.append(item.raiseContextMenu)
+    for hook in hooks:
+        hook(Click())
+    assert opened == [(10, 20)] * len(hooks)
+    # the handlers keep no reference to the panel (a cycle the PySide6 GC can crash on)
+    del hooks
+    ref = weakref.ref(panel)
+    gc.disable()
+    try:
+        del panel
+        assert ref() is None
+    finally:
+        gc.enable()

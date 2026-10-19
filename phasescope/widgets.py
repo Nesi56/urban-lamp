@@ -86,7 +86,6 @@ class StatusPill(QtWidgets.QLabel):
             self.setToolTip(tooltip)
 
 
-_MUTED_STYLE = f"color: {STATUS_COLORS['muted']};"
 _MESSAGE_STYLE = ("QLabel { color: white; background-color: rgba(0, 0, 0, 170); border-radius: 10px; "
                   "border: 1px solid rgba(255, 255, 255, 40); padding: 12px 18px; font-size: 13pt; }")
 
@@ -349,7 +348,7 @@ class ImagePanel(QtWidgets.QWidget):
         row.addWidget(self.profile_save_btn)
         row.addStretch(1)
         self.profile_hover_label = QtWidgets.QLabel("")
-        self.profile_hover_label.setStyleSheet(_MUTED_STYLE)
+        self.profile_hover_label.setProperty("muted", True)
         row.addWidget(self.profile_hover_label)
         box.addLayout(row)
 
@@ -1299,7 +1298,7 @@ class ParamDialog(QtWidgets.QDialog):
         self.subtitle_label = None
         if subtitle:
             self.subtitle_label = QtWidgets.QLabel(subtitle)
-            self.subtitle_label.setStyleSheet(_MUTED_STYLE)
+            self.subtitle_label.setProperty("muted", True)
             layout.addWidget(self.subtitle_label)
         self.description_label = QtWidgets.QLabel(description or "Adjust the values – the image updates live.")
         self.description_label.setWordWrap(True)
@@ -1320,7 +1319,7 @@ class ParamDialog(QtWidgets.QDialog):
 
         self.footer_label = QtWidgets.QLabel("Add step keeps it · Cancel removes it" if new
                                              else "Cancel restores the previous values")
-        self.footer_label.setStyleSheet(_MUTED_STYLE)
+        self.footer_label.setProperty("muted", True)
         self.footer_label.setWordWrap(True)
         layout.addWidget(self.footer_label)
 

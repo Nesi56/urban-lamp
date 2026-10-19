@@ -74,7 +74,7 @@ def test_filters_modes_and_measurement(app, win):
     win.pipeline.add("gaussian", {"sigma": 1.5})
     win.pipeline.add("bin", {"factor": 2})
     win._refresh_pipeline_list()
-    assert win.menu_buttons["Filters"].text().startswith("Filters (1)")
+    assert win.filters_menu.title().startswith("Filters (1)")
     assert _wait_for(app, lambda: win.last_packet.processed.shape == (240, 320))
     win.clear_pipeline()
 
@@ -707,3 +707,42 @@ def test_continuous_after_a_cancel_shows_step_progress(app, win):
     win.continuous_btn.setChecked(True)
     assert win.step_progress.format() == "step %v / %m"
     win.continuous_btn.setChecked(False)
+
+
+def test_dark_mode_switch(app, win):
+    from pyqtgraph.Qt import QtGui, QtWidgets
+
+    from phasescope import theme
+
+    win.act_dark.trigger()
+    pal = QtWidgets.QApplication.instance().palette()
+    assert theme.current() == "dark" and win._theme == "dark" and win.act_dark.isChecked()
+    assert pal.color(QtGui.QPalette.ColorRole.Window).lightness() < 80
+    win.act_dark.trigger()
+    pal = QtWidgets.QApplication.instance().palette()
+    assert theme.current() == "light" and not win.act_dark.isChecked()
+    assert pal.color(QtGui.QPalette.ColorRole.Window).lightness() > 200
+
+
+def test_dark_mode_is_remembered(app, tmp_path):
+    from pyqtgraph.Qt import QtCore
+
+    from phasescope.gui import MainWindow
+
+    ini = str(tmp_path / "settings.ini")
+    w = MainWindow(source="sim", use_gl=False, autostart=False, restore_settings=False)
+    w.settings = QtCore.QSettings(ini, QtCore.QSettings.Format.IniFormat)
+    w.set_theme("dark")
+    w._save_settings()
+    w.close()
+    w2 = MainWindow(source="sim", use_gl=False, autostart=False, restore_settings=False)
+    try:
+        assert w2._theme == "light"
+        w2.settings = QtCore.QSettings(ini, QtCore.QSettings.Format.IniFormat)
+        w2._restore_settings()
+        w2.set_theme(w2._theme)
+        assert w2._theme == "dark" and w2.act_dark.isChecked()
+    finally:
+        w2.settings = None
+        w2.set_theme("light")
+        w2.close()

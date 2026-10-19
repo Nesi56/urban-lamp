@@ -9,10 +9,16 @@ A Python desktop app for live microscope and interferometer imaging. In one wind
    - **c. Phase:** phase stepping (3-step, 4-step, 5-step Hariharan, Carré, N-step least squares) and the single-frame Fourier-transform method. It also covers phase unwrapping (Itoh, least-squares DCT, weighted least-squares, quality-guided), background removal, and conversion to height, thickness or refractive-index change.
 3. **Visualises the results in 2D and 3D:** a zoomable colour-mapped image with histogram and line profile, and an interactive 3D surface you can rotate.
 
-![2D view](docs/screenshot_2d.png)
+### Light mode: a 4-step measurement with the step-height profile
+![PhaseScope in light mode](docs/screenshot_light.png)
+
+### Dark mode: the same measurement with a filter in the processing list
+![PhaseScope in dark mode](docs/screenshot_dark.png)
+
+### The height map as a 3D surface you can rotate
 ![3D view](docs/screenshot_3d.png)
 
-*The screenshots use the built-in simulated interferometer. Live fringes are on the left. The height map from a 4-step measurement is on the right, shown with a line profile (top) and as a 3D surface (bottom).*
+*The screenshots use the built-in simulated interferometer. Live fringes are on the left and the height map is on the right. Switch between light and dark with **Dark mode** at the top right (Ctrl+Shift+D); the choice is remembered.*
 
 ---
 
@@ -59,7 +65,9 @@ You can also run `python run_phasescope.py`, or run `pip install .` and then `ph
 
 ### The three modes
 
-The toolbar has three buttons for what you want to see. Each has a key:
+The toolbar is split into a few groups with room between them. The top row has the camera (*Start / Pause live* and its status badge), the **Mode** buttons with the method box, the blue **main button**, and **Dark mode** on the right. The second row has the sample name and *Quick save*, and on the right what to **Show** (*Live only*, *Side by side*, *Analysis only*).
+
+The three mode buttons choose what you want to see. Each has a key:
 
 | Mode | Key | What you get |
 |---|---|---|
@@ -84,9 +92,11 @@ The bold button next to the modes always does the next sensible thing:
 | **Camera / processing** tab | 1 – camera source, *Detect*, *Connect*, exposure (÷2, ×2, Auto), gain and **pixel size** (µm per pixel, which gives the line profile real distances). 2 – the processing steps that run on every frame: untick a step to compare, double-click to edit, *More → Bypass all* (Ctrl+B). Filters that would spoil phase results are marked ⚠ while a phase mode is on. |
 | **Phase / measurement** tab | It only shows what the chosen method needs: the sample and light settings (wavelength presets, refractive indices or thickness, with the formula); the phase-stepping or live-phase controls; unwrapping and levelling; and *Advanced settings* (collapsed). |
 
-The **Filters**, **Transformations** and **Phase** pop-up menus are on the toolbar and in the menu bar. They also appear when you **right-click an image or the 3D view**. When you pick a filter, a dialog with sliders opens and the image updates live while you drag. *Add step* keeps the filter and *Cancel* removes it.
+The **Filters**, **Transformations** and **Phase** pop-up menus are in the menu bar (Filters shows how many are switched on, e.g. *Filters (1)*). They also appear when you **right-click an image or the 3D view**, and *Add filter* / *Add transformation* are in the Camera / processing tab. When you pick a filter, a dialog with sliders opens and the image updates live while you drag. *Add step* keeps the filter and *Cancel* removes it.
 
 **Enlarge a view:** double-click an image, or use *Live only / Side by side / Analysis only* (Alt+1/2/3). Esc returns. F9 hides the side panels and F11 switches to full screen. **F1** lists every keyboard shortcut.
+
+**Dark mode:** press *Dark mode* at the top right of the toolbar, choose *View → Dark mode*, or press Ctrl+Shift+D. The whole window switches to dark colours (the image areas are dark in both modes) and PhaseScope remembers the choice for the next start.
 
 ### Measuring a step height
 
@@ -127,7 +137,7 @@ Pixels whose fringe contrast is below *Min. fringe contrast* (Advanced) are left
   The files go to `Documents/PhaseScope data/<date>/` (or *File → Choose save folder…*), named `<date_time>_<sample>_<method>`. Type the sample name in the toolbar.
 - **Save measurement as…** (Ctrl+Shift+S) writes the same set under a name and folder you choose. The single-file save commands are still in the *File* menu.
 
-PhaseScope remembers your camera, exposure, wavelength and refractive indices, piezo settings, pixel size, save folder and window layout between sessions. *Help → Reset all settings…* forgets them. Processing steps are not restored, so every session starts with clean images.
+PhaseScope remembers your camera, exposure, wavelength and refractive indices, piezo settings, pixel size, save folder, window layout and light or dark mode between sessions. *Help → Reset all settings…* forgets them. Processing steps are not restored, so every session starts with clean images.
 
 ## Code layout
 
@@ -138,6 +148,7 @@ phasescope/
   phase.py        phase stepping, Fourier method, unwrapping, detrending, unit conversion
   acquisition.py  background acquisition thread (live frames and phase-step sequences)
   widgets.py      2D image panel (overlays, profile tool), 3D surface panel, parameter dialog, status pills
+  theme.py        light and dark colour themes (Fusion style, palette and spacing)
   gui.py          main window, menus, docks
 tests/            pytest suite (algorithms are checked against known phase maps)
 ```

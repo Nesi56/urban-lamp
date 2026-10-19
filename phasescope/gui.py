@@ -15,7 +15,7 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
-from . import __version__
+from . import __version__, theme
 from .acquisition import AcquisitionThread, FramePacket
 from .camera import (CameraError, CameraSource, ManualShifter, OpenCVCamera, PhaseShifter, SerialPiezoShifter,
                      SimulatedInterferometer, SimulatedShifter, StaticImageSource, ThorlabsCamera,
@@ -238,7 +238,7 @@ def _set_row_visible(form: QtWidgets.QFormLayout, field: QtWidgets.QWidget, visi
 def _muted(text: str = "") -> QtWidgets.QLabel:
     lab = QtWidgets.QLabel(text)
     lab.setWordWrap(True)
-    lab.setStyleSheet(f"color: {STATUS_COLORS['muted']}")
+    lab.setProperty("muted", True)  # coloured by the theme's style sheet
     return lab
 
 
@@ -322,6 +322,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._result_source = None
         self._source_serial = 0
         self._view_mode = "both"
+        self._theme = "light"
         self._shortcut_actions: list[tuple[str, QtGui.QAction]] = []
         self._exposure_by_source: dict[str, dict] = {}
         self._detector = _Signaller()
@@ -337,6 +338,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._default_state = self.saveState()
 
         saved_source = self._restore_settings()
+        self.set_theme(self._theme)
         if source is None:
             source = saved_source or "sim"
         self.source_combo.setCurrentIndex(list(SOURCES).index(source if source in SOURCES else "sim"))
@@ -449,6 +451,9 @@ class MainWindow(QtWidgets.QMainWindow):
                                group="Measurement")
 
         # files
+        self.act_dark = A("☾  Dark mode", lambda on: self.set_theme("dark" if on else "light"), "Ctrl+Shift+D",
+                          checkable=True, tip="Switch the whole window between light and dark colours",
+                          group="View")
         self.act_quick_save = A("Quick save", self.quick_save, "Ctrl+S",
                                 tip="Save the frame, map, picture and an info sheet - no questions asked",
                                 group="Files", icon=sp.SP_DialogSaveButton)
@@ -654,6 +659,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.channel_combo.setToolTip("What the analysis area shows")
         self.channel_combo.currentIndexChanged.connect(lambda _: self._channel_changed())
         bar.addWidget(self.channel_combo, 1)
+        bar.addSpacing(14)
         bar.addWidget(QtWidgets.QLabel("Colours"))
         self.cmap_combo = QtWidgets.QComboBox()
         self.cmap_combo.addItems(["Auto"] + COLORMAPS)
@@ -668,6 +674,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                         "to keep your own)  (A)")
         self.autolevel_check.setChecked(True)
         self.autolevel_check.toggled.connect(lambda v: setattr(self.analysis_panel, "auto_levels", v))
+        bar.addSpacing(14)
         bar.addWidget(self.autolevel_check)
         self.profile_check = QtWidgets.QCheckBox("Profile")
         self.profile_check.setToolTip("Line profile with step-height tool: drag the magenta line on the map  (L)")
@@ -742,6 +749,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def _dock(self, name: str, title: str, widget: QtWidgets.QWidget) -> QtWidgets.QDockWidget:
         dock = QtWidgets.QDockWidget(title, self)
         dock.setObjectName(name)  # stable for saveState()
+        for form in widget.findChildren(QtWidgets.QFormLayout):  # room between the rows
+            form.setVerticalSpacing(10)
+            form.setHorizontalSpacing(14)
+        for box in widget.findChildren(QtWidgets.QVBoxLayout):
+            if box.spacing() < 10:
+                box.setSpacing(10)
+        if widget.layout() is not None:
+            widget.layout().setContentsMargins(10, 8, 10, 10)
+            widget.layout().setSpacing(14)
         for combo in widget.findChildren(QtWidgets.QComboBox):  # let long entries shrink
             combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             combo.setMinimumContentsLength(12)
@@ -799,21 +815,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.exposure_spin.setStepType(QtWidgets.QAbstractSpinBox.StepType.AdaptiveDecimalStepType)
         self.exposure_spin.setSpecialValueText("–")
         self.exposure_spin.valueChanged.connect(self._exposure_changed)
+        ecol = QtWidgets.QVBoxLayout()
+        ecol.setSpacing(6)
+        ecol.addWidget(self.exposure_spin)
         erow = QtWidgets.QHBoxLayout()
-        erow.addWidget(self.exposure_spin, 1)
+        ecol.addLayout(erow)
         for text, factor, tip in (("÷2", 0.5, "Halve the exposure"), ("×2", 2.0, "Double the exposure")):
-            b = QtWidgets.QToolButton()
+            b = QtWidgets.QPushButton()
             b.setText(text)
             b.setToolTip(tip)
             b.clicked.connect(lambda _=False, k=factor: self.exposure_spin.setValue(self.exposure_spin.value() * k))
             erow.addWidget(b)
-        b = QtWidgets.QToolButton()  # short label; mirrors the Auto exposure action
-        b.setText("Auto")
+        b = QtWidgets.QPushButton()  # mirrors the Auto exposure action
+        b.setText("Auto exposure")
         b.setToolTip(self.act_auto_exposure.toolTip())
         b.clicked.connect(self.act_auto_exposure.trigger)
         self.act_auto_exposure.changed.connect(lambda b=b: b.setEnabled(self.act_auto_exposure.isEnabled()))
         erow.addWidget(b)
-        self.exposure_row = _wrap(erow)
+        erow.addStretch(1)
+        self.exposure_row = _wrap(ecol)
         f.addRow("Exposure", self.exposure_row)
         self.gain_spin = QtWidgets.QDoubleSpinBox()
         self.gain_spin.setKeyboardTracking(False)
@@ -1103,8 +1123,20 @@ class MainWindow(QtWidgets.QMainWindow):
         return w
 
     def _build_toolbars(self) -> None:
+        def gap(width: int = 16) -> QtWidgets.QWidget:
+            w = QtWidgets.QWidget()
+            w.setFixedWidth(width)
+            return w
+
+        def stretch() -> QtWidgets.QWidget:
+            w = QtWidgets.QWidget()
+            w.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+            return w
+
+        # row 1: camera | what to do (mode, method, main button) | dark mode
         tb = self.addToolBar("Main")
         tb.setObjectName("Main toolbar")
+        tb.setMovable(False)
         tb.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.main_toolbar = tb
         tb.addAction(self.act_live)
@@ -1112,6 +1144,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_pill.setToolTip("Camera status")
         tb.addWidget(self.status_pill)
         tb.addSeparator()
+        tb.addWidget(QtWidgets.QLabel("Mode"))
         for key in ("image", "live_phase", "measure"):
             tb.addAction(self.mode_actions[key])
         self.algo_combo = QtWidgets.QComboBox()
@@ -1122,37 +1155,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self.algo_combo.setCurrentIndex(list(ALGORITHMS).index("4step"))
         self.algo_combo.setToolTip("Phase-stepping method used by Measure")
         self.algo_combo.currentIndexChanged.connect(self._algo_changed)
+        tb.addWidget(gap(6))
         tb.addWidget(self.algo_combo)
+        tb.addWidget(gap(12))
         self.primary_btn = QtWidgets.QToolButton()
+        self.primary_btn.setObjectName("primaryButton")  # accent colour in the theme
         self.primary_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.primary_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.MenuButtonPopup)
-        self.primary_btn.setStyleSheet("QToolButton { font-weight: bold; padding: 3px 10px; }")
         self.primary_btn.clicked.connect(self._primary_clicked)
         self.primary_menu = QtWidgets.QMenu(self.primary_btn)
         self.primary_btn.setMenu(self.primary_menu)
         tb.addWidget(self.primary_btn)
-        tb.addSeparator()
-        self.menu_buttons = {}
-        for menu in (self.filters_menu, self.transforms_menu, self.phase_menu):
-            b = QtWidgets.QToolButton()
-            b.setText(menu.title() + " ")
-            b.setMenu(menu)
-            b.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
-            b.setToolTip(f"{menu.title()} pop-up menu (also on right-click of the images)")
-            tb.addWidget(b)
-            self.menu_buttons[menu.title()] = b
+        tb.addWidget(stretch())
+        tb.addAction(self.act_dark)  # Filters, Transformations and Phase live in the menu bar and right-click
 
+        # row 2: sample name and saving | screen layout
         self.addToolBarBreak()
         tb2 = self.addToolBar("Save and view")
         tb2.setObjectName("Save toolbar")
+        tb2.setMovable(False)
         tb2.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        tb2.addWidget(QtWidgets.QLabel(" Sample "))
+        tb2.addWidget(QtWidgets.QLabel("Sample"))
         self.sample_edit = QtWidgets.QLineEdit()
         self.sample_edit.setPlaceholderText("name / note for file names")
-        self.sample_edit.setMaximumWidth(200)
+        self.sample_edit.setMinimumWidth(180)
+        self.sample_edit.setMaximumWidth(260)
         tb2.addWidget(self.sample_edit)
+        tb2.addWidget(gap(6))
         tb2.addAction(self.act_quick_save)
-        tb2.addSeparator()
+        tb2.addWidget(stretch())
+        tb2.addWidget(QtWidgets.QLabel("Show"))
         for key in ("live", "both", "analysis"):
             tb2.addAction(self.view_actions[key])
 
@@ -1193,6 +1225,7 @@ class MainWindow(QtWidgets.QMainWindow):
                   self.act_show_clipped, self.act_live_hist):
             m.addAction(a)
         m.addSeparator()
+        m.addAction(self.act_dark)
         m.addAction(self.act_panels)
         m.addAction(self.act_fullscreen)
         m.addAction("Reset layout", self.reset_layout)
@@ -2333,8 +2366,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline_empty.setVisible(n == 0)
         nf = sum(1 for s in self.pipeline.steps if s.op.category == "filter" and s.enabled)
         nt = sum(1 for s in self.pipeline.steps if s.op.category == "transform" and s.enabled)
-        self.menu_buttons["Filters"].setText(f"Filters ({nf}) " if nf else "Filters ")
-        self.menu_buttons["Transformations"].setText(f"Transformations ({nt}) " if nt else "Transformations ")
+        self.filters_menu.setTitle(f"Filters ({nf})" if nf else "Filters")  # how many are on
+        self.transforms_menu.setTitle(f"Transformations ({nt})" if nt else "Transformations")
         title = "2  Processing (runs on every frame)"
         if self.pipeline.bypass:
             title += " - BYPASSED"
@@ -3470,6 +3503,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sample_edit.setText(state.get("sample", ""))
             self.adv_btn.setChecked(bool(state.get("advanced", False)))
             self.act_true_brightness.setChecked(bool(state.get("true_brightness", True)))
+            self._theme = state.get("theme", "light") if state.get("theme") in theme.THEMES else "light"
             self.act_show_clipped.setChecked(bool(state.get("show_clipped", True)))
             if state.get("device"):
                 self.device_combo.setEditText(str(state["device"]))
@@ -3493,6 +3527,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._remember_exposure()
         cfg = self.phase_cfg
         state = {
+            "theme": self._theme,
             # the camera / shifter the user chose - also while the simulator stands in after a failed start
             "source": self._source_key(),
             "device": self._device_text(),
@@ -3516,6 +3551,14 @@ class MainWindow(QtWidgets.QMainWindow):
         s.setValue("geometry", self.saveGeometry())
         s.setValue("windowState", self.saveState())
         s.setValue("splitter", self.splitter.saveState())
+
+    def set_theme(self, name: str) -> None:
+        """Light or dark colours for the whole window (remembered for the next start)."""
+        self._theme = name if name in theme.THEMES else "light"
+        theme.apply(QtWidgets.QApplication.instance(), self._theme)
+        self.act_dark.blockSignals(True)
+        self.act_dark.setChecked(self._theme == "dark")
+        self.act_dark.blockSignals(False)
 
     def reset_settings(self) -> None:
         if self.settings is None:

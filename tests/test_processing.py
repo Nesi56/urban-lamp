@@ -4,7 +4,7 @@ import pytest
 from phasescope.processing import REGISTRY, Param, Pipeline, apply_operation, operations, register
 
 UNSAFE = {"canny", "sobel", "laplacian", "threshold", "hist_eq", "clahe", "gamma", "morphology", "log",
-          "fft_spectrum"}
+          "fft_spectrum", "fourier_threshold"}
 
 
 @pytest.fixture

@@ -139,6 +139,42 @@ Pixels whose fringe contrast is below *Min. fringe contrast* (Advanced) are left
 
 PhaseScope remembers your camera, exposure, wavelength and refractive indices, piezo settings, pixel size, save folder, window layout and light or dark mode between sessions. *Help → Reset all settings…* forgets them. Processing steps are not restored, so every session starts with clean images.
 
+## The Threshold filter in C
+
+`c/threshold.c` is the *Threshold* subroutine of the original C program (`Ventana::CmThres`), rewritten as plain C99 with no Windows, frame-grabber or dialog code. It works for any image size, not only powers of two.
+
+```
+out = Thres(Im, rad, thres)
+```
+
+| Step | Function (same name as the original) | What it does |
+|---|---|---|
+| 1. Fourier transform | `fft2dd(b)` | 2-D FFT; the zero frequency is moved to the centre (rows/2, columns/2) |
+| 2. Circular filter with threshold | `imagfouf(imf, b)`, `filtcirct(imf, b, thres, rad, rad+10)`, `filtcirc(b, rad)` | removes every frequency whose strength log10(1 + \|F\|) is below `thres` (the mean level is always kept), and everything farther than `rad` pixels from the centre |
+| 3. Inverse Fourier transform | `fft2di(b)` | back to the image |
+| 4. Intensity | `getintens(b)`, `findmamime(...)`, `floattobyte(...)` | \|b\|², scaled to 0–255 |
+
+**Build and run** (Linux or macOS with a C compiler, or Windows with MinGW / MSYS2):
+
+```bash
+cd c
+make                       # Linux: the program "thres" and libthreshold.so  (macOS: make mac, Windows: make windows)
+./thres input.pgm output.pgm 24 1 spectrum.pgm     # radius 24 px, threshold 1, optional spectrum picture
+```
+
+Images are PGM files (8 or 16 bit). ImageJ, GIMP and IrfanView save them. From your own C code, include `threshold.h` and call one of:
+
+```c
+int Thres (const unsigned char *im, unsigned char *out, int ny, int nx, float rad, float thres);  /* 8-bit */
+int ThresF(const float *im, float *out, unsigned char *spectrum, int ny, int nx, float rad, float thres);
+```
+
+Both return 0 on success. `ThresF` takes any bit depth and can also return the filtered spectrum.
+
+**In PhaseScope** the filter is *Filters → Fourier → Threshold (Fourier, C)*, with the radius and threshold as sliders. It uses the C library when it has been built (`make` in `c/`, or `python -m phasescope.cthreshold`), and otherwise an identical NumPy version (`phasescope/cthreshold.py`); the tests check that both give the same image.
+
+> The original helper functions (`fft2dd`, `filtcirct`, `filtcirc`, `imagfouf`, …) were not available, so their behaviour above is a reconstruction. Each keeps its original name and arguments in `threshold.c`; if the original `filtcirct` does something different, replace that one function.
+
 ## Code layout
 
 ```
@@ -150,6 +186,8 @@ phasescope/
   widgets.py      2D image panel (overlays, profile tool), 3D surface panel, parameter dialog, status pills
   theme.py        light and dark colour themes (Fusion style, palette and spacing)
   gui.py          main window, menus, docks
+  cthreshold.py   the C Threshold filter for PhaseScope (loads c/, NumPy twin)
+c/                the Threshold filter in C: threshold.c / .h, the "thres" program, Makefile
 tests/            pytest suite (algorithms are checked against known phase maps)
 ```
 

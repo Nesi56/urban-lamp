@@ -6,3 +6,12 @@ build/
 dist/
 .venv/
 venv/
+# compiled C filter (build with 'make' in c/)
+c/thres
+c/thres.exe
+c/*.so
+c/*.dll
+c/*.dylib
+phasescope/*.so
+phasescope/*.dll
+phasescope/*.dylib

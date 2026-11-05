@@ -407,6 +407,18 @@ def fft_bandpass(img, state, low, high, profile):
     return _fourier_mask(img, mask) + float(img.mean())
 
 
+@register("fourier_threshold", "Threshold (Fourier, C)", "filter", group="Fourier", phase_safe=False, params=(
+    Param("rad", "Radius (px)", "float", 24.0, 0.0, 5000.0, 1.0, decimals=1),
+    Param("thres", "Threshold (log10 |F|)", "float", 1.0, 0.0, 15.0, 0.1, decimals=2)),
+    description="The Threshold filter of the C program (c/threshold.c): Fourier transform, keep only the "
+                "frequencies within the radius whose strength is above the threshold, transform back and "
+                "show the intensity scaled to 0–255 (runs in C when the library is built) – gives an "
+                "intensity image, not before phase analysis.")
+def fourier_threshold(img, state, rad, thres):
+    from .cthreshold import threshold
+    return threshold(img, rad, thres)
+
+
 @register("background", "Background subtraction / flat-field", "filter", group="Background", params=(
     Param("mode", "Mode", "choice", "subtract", choices=("subtract", "divide (flat-field)")),
     Param("frames", "Frames averaged for background", "int", 10, 1, 500),
